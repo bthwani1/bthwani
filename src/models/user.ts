@@ -1,6 +1,22 @@
-import mongoose, { Model, Types } from "mongoose";
+import mongoose, { Model, Schema, Types } from "mongoose";
 import { UserType } from "../types/user.types";
+export interface EmailVerification {
+  codeHash: string;
+  expiresAt: Date;
+  channel: VerificationChannel;
+  attempts: number;
+}
+type VerificationChannel = 'email' | 'sms' | 'whatsapp';
 
+const EmailVerificationSchema = new Schema<EmailVerification>(
+  {
+    codeHash: { type: String, required: true },
+    expiresAt: { type: Date, required: true },
+    channel: { type: String, enum: ['email', 'sms', 'whatsapp'], required: true },
+    attempts: { type: Number, default: 0 },
+  },
+  { _id: false }
+);
 // 🏠 عنوان المستخدم
 const AddressSchema = new mongoose.Schema({
   label: String,
@@ -160,13 +176,21 @@ defaultAddressId: {
 UserSchema.index({ donationLocation: "2dsphere" }, { sparse: true });
 
 export interface UserDocument extends Document, UserType {
+  emailVerified: boolean;
+  emailVerification?: EmailVerification; // 👈 أضِفه هنا
   donationLocation?: {
     type: "Point";
     coordinates: [number, number];
     updatedAt?: Date;
   };
 }
+
+UserSchema.index({ createdAt: -1 });
+
 export const User: Model<UserDocument> = mongoose.model<UserDocument>(
   "User",
   UserSchema
 );
+UserSchema.add({
+  emailVerification: { type: EmailVerificationSchema, required: false },
+});

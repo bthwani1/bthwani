@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { User } from '../../models/user';
+import mongoose from 'mongoose';
 
 export const addAddress = async(req: Request, res: Response) => {
   try {
@@ -45,31 +46,47 @@ res.status(404).json({ message: "User not found" });
 
 
 export const updateAddress = async (req: Request, res: Response) => {
-  const { id } = req.params;
+  const { id } = req.params; // address _id
+
   try {
     if (!req.user?.uid) {
       res.status(401).json({ message: "Unauthorized" });
       return;
     }
+    if (!mongoose.isValidObjectId(id)) {
+      res.status(400).json({ message: "Invalid address id" });
+      return;
+    }
 
     const user = await User.findOne({ firebaseUID: req.user.uid });
     if (!user) {
-      res.status(404).json({ message: 'User not found' });
+      res.status(404).json({ message: "User not found" });
       return;
-    } 
-    const index = user.addresses.findIndex((_, i) => i.toString() === id);
-    if (index === -1) {
-      res.status(404).json({ message: 'Address not found' });
-      return;
-    } 
+    }
 
-    user.addresses[index] = { ...user.addresses[index], ...req.body };
+    const addr: any = user.addresses.find((addr: any) => addr._id.toString() === id); // ← البحث بالـ _id
+    if (!addr) {
+      res.status(404).json({ message: "Address not found" });
+      return;
+    }
+
+    // لا تسمح بتعديل _id أبداً
+    const { _id, id: _ignore, label, city, street, location } = req.body;
+
+    if (label !== undefined) addr.label = label;
+    if (city !== undefined) addr.city = city;
+    if (street !== undefined) addr.street = street;
+    if (location !== undefined) addr.location = location;
+
     await user.save();
-    res.status(200).json(user.addresses[index]);
+      res.status(200).json(addr);
+    return;
   } catch (err) {
-    res.status(500).json({ message: 'Error updating address', error: err });
+    res.status(500).json({ message: "Error updating address", error: err });
+    return;
   }
 };
+
 
 export const deleteAddress = async (req: Request, res: Response) => {
   const { id } = req.params;

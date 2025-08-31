@@ -5,6 +5,7 @@ import {
   createDriver,
   listDrivers,
   resetPassword,
+  searchDrivers,
   setJokerStatus,
   toggleBan,
   updateWallet,
@@ -110,6 +111,12 @@ verifyAdmin,
   getActiveDriversCount
 );
 
+router.get(
+  "/search",
+ verifyFirebase,                   // ← هذا يحلّل الـ JWT ويضع req.user
+verifyAdmin,
+  searchDrivers
+);
 /**
  * @swagger
  * /admin/drivers:

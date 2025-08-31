@@ -8,32 +8,23 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 
 export const vendorLogin = async (req, res) => {
-  const { phone, password } = req.body;
-    console.log('بيانات الدخول:', phone, password);
-
-  if (!phone || !password) {
-     res.status(400).json({ error: "رقم الهاتف وكلمة المرور مطلوبة" });
-     return;
+  const { phone, email, password } = req.body;
+  if ((!phone && !email) || !password) {
+    res.status(400).json({ error: "أدخل البريد أو الهاتف مع كلمة المرور" });
+    return;
   }
 
-  // ابحث عن التاجر برقم الجوال
-  const vendor = await Vendor.findOne({ phone });
-  if (!vendor) {
-res.status(400).json({ error: 'رقم الهاتف غير صحيح' });
-    return;
-  } 
+  const where: any = phone ? { phone } : { email: String(email).toLowerCase() };
+  const vendor = await Vendor.findOne(where);
+  if (!vendor) { res.status(400).json({ error: 'بيانات الدخول غير صحيحة' }); return; }
 
-  // تحقق من كلمة المرور
   const isMatch = await bcrypt.compare(password, vendor.password);
-  if (!isMatch) {
-res.status(400).json({ error: 'كلمة المرور غير صحيحة' });
-    return;
-  } 
+  if (!isMatch) { res.status(400).json({ error: 'بيانات الدخول غير صحيحة' }); return; }
 
-  // إصدار توكن JWT
   const token = jwt.sign({ id: vendor._id, role: 'vendor' }, process.env.JWT_SECRET, { expiresIn: '7d' });
   res.json({ token, vendor });
 };
+
 
 // جلب بيانات التاجر (Vendor) بناءً على الـ userId الموجود في الـ JWT
 export const getMyProfile = async (req: Request, res: Response) => {

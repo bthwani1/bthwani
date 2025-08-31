@@ -2,29 +2,19 @@ import { Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import Order from "../../models/delivry_Marketplace_V1/Order";
 import Driver from "../../models/Driver_app/driver";    // ← هذا الاستيراد مطلوب
+import { ensureGLForDriver } from "../../accounting/services/ensureEntityGL";
 
 export const createDriver = async (req: Request, res: Response) => {
   try {
     const {
-      fullName,
-      phone,
-      email,
-      password,
-      role,
-      vehicleType,
-      isFemaleDriver,
-      driverType,          // "primary" | "joker"
-      // بيانات العنوان ضرورية الآن
-      residenceLocation: {
-        address,
-        governorate,
-        city,
-        lat,
-        lng
-      }
+      fullName, phone, email, password, role, vehicleType,
+      isFemaleDriver, driverType,
+      residenceLocation: { address, governorate, city, lat, lng }
     } = req.body;
 
     const hashedPassword = await bcrypt.hash(password, 10);
+
+    // 1) إنشاء السائق
     const driver = await Driver.create({
       fullName,
       phone,
@@ -34,18 +24,44 @@ export const createDriver = async (req: Request, res: Response) => {
       vehicleType,
       isFemaleDriver,
       driverType,
-      // يوثق تلقائيًا لأن الإنشاء من الأدمن
       isVerified: true,
-      // ملء residenceLocation من البودي
-      residenceLocation: { address, governorate, city, lat, lng }
+      residenceLocation: { address, governorate, city, lat, lng },
+      // location geo default موجود في السكيمة
     });
+
+    // 2) إنشاء/ضمان الحسابات التحليلية وربطها (1211-x و 1601/2161-x)
+    const { ar, deposit } = await ensureGLForDriver(driver._id.toString(), {
+      driverName: fullName,
+      driverCodeSuffix: driver._id.toString().slice(-6), // اختياري لشكل الكود
+    });
+
+    // 3) حدّث السائق لو ما كانت موجودة
+    const patch: any = {};
+    if (!driver.glReceivableAccount) patch.glReceivableAccount = ar;
+    if (!driver.glDepositAccount && deposit) patch.glDepositAccount = deposit;
+
+    if (Object.keys(patch).length) {
+      await Driver.findByIdAndUpdate(driver._id, patch, { new: true });
+      Object.assign(driver, patch);
+    }
 
     res.status(201).json(driver);
   } catch (error: any) {
-    res.status(500).json({ message: "Error creating driver", error });
+    res.status(500).json({ message: "Error creating driver", error: error?.message || error });
   }
 };
-
+export const searchDrivers = async (req: Request, res: Response) => {
+  const q = (req.query.q as string) || "";
+  const limit = Math.min(parseInt((req.query.limit as string) || "20"), 50);
+  const regex = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+  const drivers = await Driver.find({
+    $or: [{ fullName: regex }, { phone: { $regex: q, $options: "i" } }],
+  })
+    .select("_id fullName phone")
+    .limit(limit)
+    .lean();
+  res.json(drivers);
+};
 // تبديل نوع السائق (primary ↔ joker) مع ضبط نافذة الجوكر
 export const setJokerStatus = async (req: Request, res: Response) => {
   const { driverType, jokerFrom, jokerTo } = req.body;

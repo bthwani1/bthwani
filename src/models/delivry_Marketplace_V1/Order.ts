@@ -1,5 +1,32 @@
 import mongoose, { Document, Schema, Types } from "mongoose";
 
+export interface INote {
+  _id?: Types.ObjectId;
+  body: string;
+  visibility: "public" | "internal";
+  byRole: "customer" | "admin" | "store" | "driver" | "system";
+  byId?: Types.ObjectId;
+  createdAt: Date;
+}
+const noteSchema = new Schema<INote>(
+  {
+    body: { type: String, required: true }, // نص الملاحظة
+    visibility: {
+      type: String,
+      enum: ["public", "internal"], // public تظهر للعميل، internal داخلية فقط
+      default: "internal",
+    },
+    byRole: {
+      type: String,
+      enum: ["customer", "admin", "store", "driver", "system"],
+      required: true,
+    },
+    byId: { type: Schema.Types.ObjectId, required: false }, // معرف كاتب الملاحظة إن توفر
+    createdAt: { type: Date, default: Date.now },
+  },
+  { _id: true }
+);
+
 interface IRating {
   company: number; // 1–5
   order: number; // 1–5
@@ -12,6 +39,7 @@ export type OrderStatus =
   | "pending_confirmation" // في انتظار تأكيد الطلب من الإدارة
   | "under_review" // قيد المراجعة → تُعطى للدليفري
   | "preparing" // قيد التحضير (داخل المطعم/المتجر)
+  | "assigned" // قيد التوصيل (من الدليفري)
   | "out_for_delivery" // في الطريق إليك (من الدليفري)
   | "delivered" // تم التوصيل
   | "returned" // الارجاع (من الأدمن)
@@ -79,7 +107,7 @@ updatedAt?: Date;
   deliveryReceiptNumber?: string; // رقم السند
 
   deliveredAt?: Date;
-  notes?: string;
+  notes?: INote[];
 }
 
 const statusHistorySchema = new Schema<IStatusHistoryEntry>(
@@ -237,7 +265,9 @@ paymentMethod: {
       enum: ["admin", "customer", "driver", "store"],
     },
     scheduledFor: Date,
-    notes: String,
+    notes: { type: [noteSchema], default: [] },
+
+
   },
   { timestamps: true }
 );
@@ -249,5 +279,11 @@ orderSchema.pre("findOneAndUpdate", function (next) {
   this.setUpdate(u);
   next();
 });
-
+orderSchema.index({ status: 1, createdAt: -1 });
+orderSchema.index({ "address.city": 1 });
+orderSchema.index({ "subOrders.store": 1 });
+orderSchema.index({ "subOrders.driver": 1 });
+orderSchema.index({ "items.store": 1 });
+orderSchema.index({ createdAt: -1 });
+orderSchema.index({ user: 1, createdAt: -1 });
 export default mongoose.model<IDeliveryOrder>("DeliveryOrder", orderSchema);

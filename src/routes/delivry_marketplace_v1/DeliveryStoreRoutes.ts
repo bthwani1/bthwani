@@ -48,7 +48,7 @@ const router = express.Router();
  *         description: خطأ في الخادم أثناء إنشاء المتجر.
  */
 router.post("/", verifyFirebase, verifyAdmin, controller.create);
-
+router.get("/search", verifyFirebase, verifyAdmin, controller.searchStores);
 /**
  * @swagger
  * /delivery/stores:

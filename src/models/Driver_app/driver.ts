@@ -27,6 +27,8 @@ export interface IDriver extends Document {
   // متر | دراجة | سيارة
   vehicleType: "motor" | "bike" | "car";
 
+  glReceivableAccount?: Types.ObjectId;
+  glDepositAccount?: Types.ObjectId;
   // نوع المندوب من البداية
   driverType: DriverType;
 
@@ -118,6 +120,8 @@ location: {
     default: [0, 0]
   }
 },
+glReceivableAccount: { type: Schema.Types.ObjectId, ref: 'ChartAccount' }, // 1211-xxxxx
+glDepositAccount:    { type: Schema.Types.ObjectId, ref: 'ChartAccount' }, // 2161-xxxxx (أو 1601 لو أصريت تجعلها أصل)
     isAvailable:    { type: Boolean, default: true },
     isFemaleDriver: { type: Boolean, default: false },
     isVerified:     { type: Boolean, default: false },

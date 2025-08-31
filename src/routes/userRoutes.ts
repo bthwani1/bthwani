@@ -1,6 +1,7 @@
 // src/routes/userRoutes.ts
 
 import { Router, Request, Response } from "express";
+import * as crypto from "crypto";
 import { verifyFirebase } from "../middleware/verifyFirebase";
 import {
   registerOrUpdateUser,
@@ -12,6 +13,7 @@ import {
   getUserStats,
   deactivateAccount,
   getAddresses,
+  searchUsers,
 } from "../controllers/user/userController";
 import {
   addAddress,
@@ -69,7 +71,11 @@ const router = Router();
  *         description: لم يتم تقديم توكين صالح أو انتهت صلاحيته.
  */
 router.get("/me", verifyFirebase, getCurrentUser);
-
+router.get(
+  "/search",
+ verifyFirebase,                   // ← هذا يحلّل الـ JWT ويضع req.user
+  searchUsers
+);
 /**
  * @swagger
  * /api/v1/users/init:
@@ -99,6 +105,8 @@ router.get("/me", verifyFirebase, getCurrentUser);
  *         description: التوكين مفقود أو غير صالح.
  */
 router.post("/init", verifyFirebase, registerOrUpdateUser);
+
+
 
 /**
  * @swagger
@@ -627,52 +635,78 @@ router.patch(
 router.patch("/avatar", verifyFirebase, uploadAvatar);
 
 
-router.post("/otp/send", async (req, res) => {
-  const { email } = req.body;
-  if (!email) {
-    res.status(400).json({ message: "البريد مطلوب" });
-    return;
-  }
-  const user = await User.findOne({ email });
-  if (!user) {
-    res.status(404).json({ message: "المستخدم غير موجود" });
-    return;
-  }
-
+router.post("/otp/send", verifyFirebase, async (req, res) => {
   try {
-    await sendEmailOTP(email, user._id.toString(), "verifyEmail");
-    res.status(200).json({ message: "تم إرسال رمز التحقق إلى البريد" });
-  } catch (err) {
-    console.error("❌ فشل إرسال OTP:", err);
-    res.status(500).json({ message: "فشل الإرسال", error: err });
-  }
-});
+    const fb = (req as any).firebaseUser;
+    const uid = fb?.uid;
+    const email = fb?.email;
 
-router.post("/otp/verify", async (req, res) => {
-  const { code, purpose, userId, email } = req.body;
-
-  console.log("📥 البيانات المستلمة للتحقق:", { code, purpose, userId, email });
-
-  if (!code || !purpose) {
-     res.status(400).json({ message: "البيانات غير مكتملة" });
-     return;
-  }
-
-  try {
-    const result = await verifyOTP({ userId, email, purpose, code });
-
-    if (result.valid) {
-       res.status(200).json({ message: "تم التحقق بنجاح", valid: true });
-       return;
-    } else {
-       res.status(400).json({ message: "رمز غير صالح أو منتهي", valid: false });
-       return;
+    if (!uid || !email) {
+      res.status(401).json({ message: "Unauthorized" });
+      return;
     }
-  } catch (err) {
-    console.error("❌ فشل التحقق من OTP:", err);
-     res.status(500).json({ message: "فشل التحقق", error: err });
-     return;
+
+    const user = await User.findOne({ firebaseUID: uid }).lean();
+    if (!user) {
+      res.status(404).json({ message: "المستخدم غير موجود" });
+      return;
+    }
+
+    // 🟢 استدعِ دالتك كما هي: (email, userId, purpose)
+    const code = await sendEmailOTP(email, String(user._id), "verifyEmail");
+
+    // وضع التطوير: أطبع الكود بدل الاعتماد على SMTP
+    const ch =  "smtp";
+    if (ch !== "smtp") {
+      console.log(`📧 DEV OTP to ${email}: ${code}`);
+      res.json({ ok: true, dev: true });
+      return;
+    }
+    res.json({ ok: true });
+    return;
+
+  } catch (err: any) {
+    console.error("❌ /users/otp/send failed:", err?.message || err);
+    res.status(500).json({ message: "فشل الإرسال", error: err?.message });
   }
 });
+
+router.post("/otp/verify", verifyFirebase, async (req, res) => {
+  try {
+    const fb = (req as any).firebaseUser;
+    const uid = fb?.uid;
+    if (!uid) {
+      res.status(401).json({ message: "Unauthorized" });
+      return;
+    }
+    const { code } = req.body || {};
+    if (!code) {
+      res.status(400).json({ message: "رمز التحقق مطلوب" });
+      return;
+    }
+
+    const user = await User.findOne({ firebaseUID: uid }).lean();
+    if (!user) {
+      res.status(404).json({ message: "المستخدم غير موجود" });
+      return;
+    }
+
+    const result = await verifyOTP({
+      userId: String(user._id),
+      purpose: "verifyEmail",
+      code: String(code),
+    });
+
+    if (!result.valid) {
+      res.status(400).json({ message: "رمز غير صحيح أو منتهي" });
+      return;
+    }
+
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error("❌ /users/otp/verify failed:", err?.message || err);
+    res.status(500).json({ message: "فشل التحقق", error: err?.message });
+  }
+});   
 
 export default router;

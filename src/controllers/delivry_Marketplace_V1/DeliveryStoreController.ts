@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import DeliveryStore from "../../models/delivry_Marketplace_V1/DeliveryStore";
 import { computeIsOpen } from "../../utils/storeStatus";
 import Vendor from "../../models/vendor_app/Vendor";
+import { ensureGLForStore } from "../../accounting/services/ensureEntityGL";
 
 // Create a new delivery store
 export const create = async (req: Request, res: Response) => {
@@ -74,6 +75,17 @@ export const create = async (req: Request, res: Response) => {
 
     const data = new DeliveryStore(body);
     await data.save();
+    try {
+      await ensureGLForStore(data._id.toString(), {
+        storeName: data.name,
+        storeCodeSuffix: data._id.toString().slice(-6),
+        payableParentCode: "2102",
+      });
+    } catch (e) {
+      // لا تكسر الإنشاء إن فشل الربط المحاسبي، فقط سجله أو أعد تحذير
+      console.warn("ensureGLForStore failed:", (e as Error).message);
+    }
+    
     res.status(201).json(data);
   } catch (error: any) {
     res.status(500).json({ message: error.message });
@@ -209,13 +221,32 @@ export const update = async (req: Request, res: Response) => {
       res.status(404).json({ message: "Store not found" });
       return;
     }
-
+    if (!updated.glPayableAccount) {
+      try {
+        await ensureGLForStore(updated._id.toString(), {
+          storeName: updated.name,
+          storeCodeSuffix: updated._id.toString().slice(-6),
+          payableParentCode: "2102",
+        });
+      } catch (e) {
+        console.warn("ensureGLForStore (update) failed:", (e as Error).message);
+      }
+    }
     res.json(updated);
   } catch (error: any) {
     res.status(500).json({ message: error.message });
   }
 };
-
+export const searchStores = async (req: Request, res: Response) => {
+  const q = (req.query.q as string) || "";
+  const limit = Math.min(parseInt((req.query.limit as string) || "20"), 50);
+  const regex = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+  const stores = await DeliveryStore.find({ name: regex })
+    .select("_id name logo")
+    .limit(limit)
+    .lean();
+  res.json(stores);
+};
 // Delete a delivery store
 export const remove = async (req: Request, res: Response) => {
   try {

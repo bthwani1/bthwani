@@ -11,13 +11,54 @@ import Driver from "../../models/Driver_app/driver";
 import { calculateDeliveryPrice } from "../../utils/deliveryPricing";
 import { getDistance } from "geolib";
 import PricingStrategy from "../../models/delivry_Marketplace_V1/PricingStrategy";
+import { getActor } from "../../utils/actor";
+import { canTransition } from "../../constants/orderStatus";
+import { pushStatusHistory } from "../../utils/orderHistory";
+import { broadcastOrder } from "../../sockets/orderEvents";
+import { postIfDeliveredOnce } from "../../accounting/hooks";
+import { broadcastOffersForOrder } from "../../services/dispatch";
+
+// 👇 ضِف أعلى هذا الملف
+function sanitizeNotes(raw: any): any[] {
+  const toNote = (v: any) => {
+    if (typeof v === "string") {
+      const body = v.trim();
+      if (!body) return null;
+      return {
+        body,
+        visibility: "internal",
+        byRole: "system",
+        createdAt: new Date(),
+      };
+    }
+    if (v && typeof v === "object") {
+      const body = (v.body ?? "").toString().trim();
+      if (!body) return null;
+      const visibility = v.visibility === "public" ? "public" : "internal";
+      const byRole = ["customer","admin","store","driver","system"].includes(v.byRole)
+        ? v.byRole
+        : "system";
+      const byId = v.byId ?? undefined;
+      const createdAt = v.createdAt ? new Date(v.createdAt) : new Date();
+      return { body, visibility, byRole, byId, createdAt };
+    }
+    return null;
+  };
+
+  if (!Array.isArray(raw)) {
+    const n = toNote(raw);
+    return n ? [n] : [];
+  }
+  return raw.map(toNote).filter(Boolean) as any[];
+}
+
 
 export const createOrder = async (req: Request, res: Response) => {
   const session = await mongoose.startSession();
   session.startTransaction();
   try {
     // 1. تحقق من المستخدم
-    const firebaseUID = req.user?.id;
+    const firebaseUID = (req as any).firebaseUser?.uid;
     if (!firebaseUID) {
       res.status(401).json({ message: "Unauthorized" });
       return;
@@ -173,58 +214,84 @@ export const createOrder = async (req: Request, res: Response) => {
       totalPlatformShare += subTotal - companyShare;
     }
 
-    // 11. المبلغ النهائي
-    const totalPrice = cart.total + deliveryFee;
+   // 11) المبلغ النهائي
+const totalPrice = cart.total + deliveryFee;
 
-    // احسب الدفع من المحفظة وباقي الكاش
-    const walletUsed = Math.min(user.wallet.balance, totalPrice);
-    const cashDue = totalPrice - walletUsed;
+// 11.1) احسب من المحفظة والكاش
+let walletUsed = 0;
+if (paymentMethod === "wallet" || paymentMethod === "mixed") {
+  walletUsed = Math.min(user.wallet.balance, totalPrice);
+}
+const cashDue = totalPrice - walletUsed;
 
-    // خصم الرصيد
-    if (walletUsed > 0) {
-      user.wallet.balance -= walletUsed;
-      await user.save({ session });
-    }
+// 11.2) خصم المحفظة مرة واحدة
+if (walletUsed > 0) {
+  user.wallet.balance -= walletUsed;
+  await user.save({ session });
+}
 
-    // 12. خصم من المحفظة
-    if (paymentMethod === "wallet") {
-      user.wallet.balance -= totalPrice;
-      await user.save({ session });
-    }
+// 11.3) حدد الـ paymentMethod النهائي و paid
+let finalPaymentMethod: "wallet" | "cash" | "card" | "mixed" = "wallet";
+if (cashDue > 0) {
+  // لو العميل اختار بطاقة: mixed (wallet + card)
+  // لو اختار كاش: mixed (wallet + cash)
+  finalPaymentMethod = "mixed";
+} else {
+  finalPaymentMethod = "wallet";
+}
+
+const paid = cashDue === 0; // لو الكاش/البطاقة لاحقًا، خليه false الآن
+let initialNotes: any[] = [];
+if (typeof notes === "string" && notes.trim()) {
+  initialNotes.push({
+    body: notes.trim(),
+    visibility: "public",     // العميل يشوفها
+    byRole: "customer",
+    byId: user._id,
+    createdAt: new Date(),
+  });
+}
+
+// 13) إنشاء الطلب
+const order = new DeliveryOrder({
+  user: user._id,
+  deliveryMode,
+  scheduledFor: scheduledFor || null,
+  address: {
+    label: chosenAddress.label,
+    street: chosenAddress.street,
+    city: chosenAddress.city,
+    location: {
+      lat: chosenAddress.location.lat,
+      lng: chosenAddress.location.lng,
+    },
+  },
+  subOrders,
+  deliveryFee,
+  price: totalPrice,
+  companyShare: totalCompanyShare,     // <-- مهم
+  platformShare: totalPlatformShare,   // <-- مهم
+  walletUsed,
+  cashDue,
+  paymentMethod: finalPaymentMethod,
+  status: "pending_confirmation",
+  paid,
+  // لو ما في ملاحظة، اتركه undefined ليشتغل default: []
+  notes: initialNotes.length ? initialNotes : undefined,
+});
 
     // 13. إنشاء الطلب
-    const order = new DeliveryOrder({
-      user: user._id,
-      deliveryMode,
-      scheduledFor: scheduledFor || null,
-      address: {
-        label: chosenAddress.label,
-        street: chosenAddress.street,
-        city: chosenAddress.city,
-        location: {
-          lat: chosenAddress.location.lat,
-          lng: chosenAddress.location.lng,
-        },
-      },
-      subOrders,
-      deliveryFee,
-      price: totalPrice,
-      companyShare: totalCompanyShare,
-      platformShare: totalPlatformShare,
-      notes,
-      walletUsed,
-
-      cashDue,
-
-      paymentMethod: cashDue > 0 ? "mixed" : "wallet",
-      status: "pending_confirmation",
-      paid: paymentMethod === "wallet" || cashDue === 0,
-    });
-
     await order.save({ session });
+
     await DeliveryCart.deleteOne({ _id: cart._id }).session(session);
     await session.commitTransaction();
 
+    broadcastOrder("order.created", order._id.toString(), {
+      status: order.status,
+      price: order.price,
+      city: order.address.city,
+      subCount: order.subOrders.length,
+    });
     // 14. إشعار العميل
     const notif = {
       title: `طلبك #${order._id} تم إنشاؤه`,
@@ -248,72 +315,368 @@ export const createOrder = async (req: Request, res: Response) => {
     session.endSession();
   }
 };
+export const assignDriver = async (req: Request, res: Response) => {
+  try {
+    const { driverId } = req.body;
+    const { id } = req.params;
+
+    const order: any = await DeliveryOrder.findById(id);
+    if (!order) {
+      res.status(404).json({ message: "Order not found" });
+      return
+    } 
+
+    const actor = getActor(req);
+    if (actor.role !== "admin") {
+      res.status(403).json({ message: "Admin only" });
+      return;
+    }
+
+    const driver = await Driver.findById(driverId);
+    if (!driver) {
+      res.status(404).json({ message: "Driver not found" });
+      return;
+    }
+
+    // 👇 عالج notes قبل أي حفظ
+    order.notes = sanitizeNotes(order.notes);
+
+    order.driver = driver._id;
+    order.status = "assigned";                // 👈 اجعلها حالة إسناد (لو مدعومة عندك)
+    order.assignedAt = new Date();
+    order.statusHistory.push({
+      status: "assigned",
+      changedAt: new Date(),
+      changedBy: "admin",
+    });
+
+    // ملاحظة نظامية
+    order.notes.push({
+      body: `تم إسناد الطلب إلى الكابتن: ${driver._id}`,
+      visibility: "internal",
+      byRole: "admin",
+      byId: actor.id,
+      createdAt: new Date(),
+    });
+
+    await order.save({ validateModifiedOnly: true });
+    broadcastOrder("order.driver.assigned", order._id.toString(), { driverId });
+
+    res.json(order);
+  } catch (e: any) {
+    res.status(500).json({ message: e.message });
+  }
+};
+
+export const assignDriverToSubOrder = async (req: Request, res: Response) => {
+  try {
+    const { orderId, subId } = req.params as any;
+    const { driverId } = req.body;
+
+    const actor = getActor(req);
+    if (actor.role !== "admin" && actor.role !== "store"){
+      res.status(403).json({ message: "Forbidden" });
+
+      return;
+    }
+
+    const order: any = await DeliveryOrder.findById(orderId);
+    if (!order) {
+      res.status(404).json({ message: "Order not found" });
+      return;
+    }
+
+    const sub = order.subOrders.id(subId);
+    if (!sub) {
+      res.status(404).json({ message: "SubOrder not found" });
+      return;
+    }
+
+    const driver = await Driver.findById(driverId);
+    if (!driver) {
+      res.status(404).json({ message: "Driver not found" });
+      return;
+    }
+
+    sub.driver = driver._id;
+    await order.save();
+    broadcastOrder("order.sub.driver.assigned", order._id.toString(), { subId, driverId });
+
+    res.json(order);
+  } catch (e: any) {
+    res.status(500).json({ message: e.message });
+  }
+};
+
+export const updateSubOrderStatus = async (req: Request, res: Response) => {
+  try {
+    const { orderId, subId } = req.params as any;
+    const { status, reason, returnBy } = req.body as { status: OrderStatus; reason?: string; returnBy?: string };
+
+    const actor = getActor(req);
+    if (!["admin", "store", "driver"].includes(actor.role)){
+      res.status(403).json({ message: "Forbidden" });
+
+      return;
+    }
+
+    const order: any = await DeliveryOrder.findById(orderId);
+    if (!order) {
+      res.status(404).json({ message: "Order not found" });
+      return;
+    }
+
+    const sub = order.subOrders.id(subId);
+    if (!sub) {
+      res.status(404).json({ message: "SubOrder not found" });
+      return;
+    }
+
+    // حارس الانتقال لــ subOrder
+    if (!canTransition(sub.status, status)) {
+      res.status(400).json({ message: `Invalid transition from ${sub.status} to ${status}` });
+      return;
+    }
+
+    // حدّث subOrder
+    pushStatusHistory(sub, status, actor.role as any, reason, returnBy as any);
+
+    // يمكنك أيضًا مزامنة حالة order العليا (اختياريًا):
+    // مثال: إذا كل subOrders = delivered → order.status=delivered
+    if (order.subOrders.every((s: any) => s.status === "delivered")) {
+      pushStatusHistory(order, "delivered", "admin");
+    }
+
+    await order.save();
+    broadcastOrder("order.sub.status", order._id.toString(), {
+      subId,
+      status,
+      by: getActor(req).role,
+    });
+    try {
+      await postIfDeliveredOnce(order);
+    } catch (e) {
+      console.error("Accounting posting failed (updateSubOrderStatus):", (e as Error).message);
+    }
+    
+    res.json(order);
+  } catch (e: any) {
+    res.status(500).json({ message: e.message });
+  }
+};
+export const setOrderPOD = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { deliveryReceiptNumber } = req.body;
+
+    const actor = getActor(req);
+    if (!["admin", "driver"].includes(actor.role)) {
+      res.status(403).json({ message: "Forbidden" });
+      return;
+    }
+
+    const order: any = await DeliveryOrder.findById(id);
+    if (!order) {
+      res.status(404).json({ message: "Order not found" });
+      return;
+    }
+
+    order.deliveryReceiptNumber = deliveryReceiptNumber;
+    await order.save();
+    broadcastOrder("order.pod.set", id, { deliveryReceiptNumber });
+
+    
+    res.json(order);
+  } catch (e: any) {
+    res.status(500).json({ message: e.message });
+  }
+};
+export const addOrderNote = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { body, visibility = "internal" } = req.body as {
+      body: string;
+      visibility?: "public" | "internal";
+    };
+
+    if (!body?.trim()) {
+      res.status(400).json({ message: "note body required" });
+      return;
+    }
+
+    const actor = getActor(req);
+
+    // العميل لا يُسمح له بإنشاء internal
+    if (actor.role === "customer" && visibility !== "public") {
+      res.status(403).json({ message: "Forbidden" });
+      return;
+    }
+
+    // لو أردت منع vendor/driver من public: عدّل الشرط أعلاه كما تريد
+
+    const order: any = await DeliveryOrder.findById(id);
+    if (!order) {
+      res.status(404).json({ message: "Order not found" });
+      return;
+    }
+
+    const note = {
+      body: body.trim(),
+      visibility,
+      byRole: actor.role,
+      byId: actor.id,
+      createdAt: new Date(),
+    };
+
+    order.notes.push(note as any);
+    await order.save();
+    broadcastOrder("order.note.added", id, {
+      visibility,
+      by: getActor(req).role,
+    });
+    
+    res.status(201).json(order.notes[order.notes.length - 1]);
+  } catch (e: any) {
+    res.status(500).json({ message: e.message });
+  }
+};
+
+export const listOrderNotes = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const actor = getActor(req);
+    const scope = (req.query.visibility as string) || "auto"; // auto = حسب الدور
+
+    const order: any = await DeliveryOrder.findById(id).select("notes").lean();
+    if (!order) {
+      res.status(404).json({ message: "Order not found" });
+      return;
+    }
+
+    let notes = order.notes || [];
+
+    if (scope === "public") notes = notes.filter((n: any) => n.visibility === "public");
+    else if (scope === "internal") notes = notes.filter((n: any) => n.visibility === "internal");
+    else {
+      // auto
+      if (actor.role === "customer") {
+        notes = notes.filter((n: any) => n.visibility === "public");
+      }
+    }
+
+    res.json(notes);
+  } catch (e: any) {
+    res.status(500).json({ message: e.message });
+  }
+};
+export const setSubOrderPOD = async (req: Request, res: Response) => {
+  try {
+    const { orderId, subId } = req.params;
+    const { deliveryReceiptNumber } = req.body;
+
+    const actor = getActor(req);
+    if (!["admin", "driver", "store"].includes(actor.role)) {
+      res.status(403).json({ message: "Forbidden" });
+      return;
+    }
+
+    const order: any = await DeliveryOrder.findById(orderId);
+    if (!order) {
+      res.status(404).json({ message: "Order not found" });
+      return;
+    }
+
+    const sub = order.subOrders.id(subId);
+    if (!sub) {
+      res.status(404).json({ message: "SubOrder not found" });
+      return;
+    }
+
+    sub.deliveryReceiptNumber = deliveryReceiptNumber;
+    await order.save();
+    broadcastOrder("order.sub.pod.set", orderId, { subId, deliveryReceiptNumber });
+
+    res.json(order);
+  } catch (e: any) {
+    res.status(500).json({ message: e.message });
+  }
+};
+
 // PUT /orders/:id/vendor-accept
 export const vendorAcceptOrder = async (req: Request, res: Response) => {
-  const order = await DeliveryOrder.findById(req.params.id);
+  const order: any = await DeliveryOrder.findById(req.params.id);
   if (!order) {
     res.status(404).json({ message: "Order not found" });
     return;
   }
 
-  // نقبل الطلب فقط إذا هو في الانتظار أو قيد المراجعة
-  if (!["pending_confirmation", "under_review"].includes(order.status)) {
-    res.status(400).json({ message: "Cannot accept in current status" });
+  if (!canTransition(order.status, "preparing")) {
+    res.status(400).json({ message: `Invalid transition from ${order.status} to preparing` });
     return;
   }
 
-  // العثور على المتجر من أول subOrder
-  const store = await DeliveryStore.findById(order.subOrders[0].store);
-  if (!store) {
-    res.status(404).json({ message: "Store not found" });
-    return;
-  }
+  // ✅ اسناد سائق
+  if (order.deliveryMode === "unified") {
+    const store = await DeliveryStore.findById(order.subOrders[0].store);
+    if (!store) {
+      res.status(404).json({ message: "Store not found" });
+      return;
+    }
 
-
-
-  // اختيار أقرب سائق
-  const driver = await Driver.findOne({
-    isAvailable: true,
-    isBanned: false,
-    $or: [
-      { isJoker: false },
-      {
-        isJoker: true,
-        jokerFrom: { $lte: new Date() },
-        jokerTo: { $gte: new Date() },
-      },
-    ],
-    currentLocation: {
-      $near: {
-        $geometry: {
-          type: "Point",
-          coordinates: [store.location.lng, store.location.lat],
+    const driver = await Driver.findOne({
+      isAvailable: true,
+      isBanned: false,
+      $or: [
+        { isJoker: false },
+        { isJoker: true, jokerFrom: { $lte: new Date() }, jokerTo: { $gte: new Date() } },
+      ],
+      currentLocation: {
+        $near: {
+          $geometry: { type: "Point", coordinates: [store.location.lng, store.location.lat] },
+          $maxDistance: 5000,
         },
-        $maxDistance: 5000,
       },
-    },
-  });
-  if (!driver) {
-    res.status(400).json({ message: "No available driver nearby" });
-    return;
+    });
+
+    if (!driver) {
+      res.status(400).json({ message: "No available driver nearby" });
+      return;
+    }
+
+    order.driver = driver._id;            // 👈 اسناد فعلي
+    if (!order.assignedAt) order.assignedAt = new Date();
+  } else {
+    // split: اسناد لكل subOrder
+    for (const sub of order.subOrders) {
+      if (sub.driver) continue;
+      const s = await DeliveryStore.findById(sub.store);
+      if (!s) continue;
+
+      const drv = await Driver.findOne({
+        isAvailable: true, isBanned: false,
+        currentLocation: {
+          $near: {
+            $geometry: { type: "Point", coordinates: [s.location.lng, s.location.lat] },
+            $maxDistance: 5000,
+          },
+        },
+      });
+      if (drv) sub.driver = drv._id;      // 👈 اسناد السائق للـ subOrder
+    }
+    if (!order.assignedAt) order.assignedAt = new Date();
   }
 
-  // عيّن السائق وحوّل الحالة إلى "preparing"
-  // تسجيل التاريخ وتحويل الحالة
-  order.status = "preparing";
-  order.statusHistory.push({
-    status: "preparing",
-    changedAt: new Date(),
-    changedBy: "store",
-  });
+  // الحالة: المتجر بدأ التحضير
+  pushStatusHistory(order, "preparing", "store");
 
-  // إذا تُريد تسجيل وقت التعيين:
-  order.assignedAt = new Date();
-  await order.save();
+  // ⚠️ لو عندك مشكلة موروثة في notes:
+  // order.notes = sanitizeNotes(order.notes);
+  await order.save({ validateModifiedOnly: true });
 
   res.json(order);
-  return;
 };
+
+
 
 export const exportOrdersToExcel = async (req, res: Response) => {
   try {
@@ -347,53 +710,65 @@ export const adminChangeStatus = async (req: Request, res: Response) => {
     "delivered",
     "returned",
     "cancelled",
+    "assigned", // 👈 لو أضفتها في الـ enum العام
   ];
   if (!validStatuses.includes(status)) {
     res.status(400).json({ message: "حالة غير صحيحة" });
     return;
   }
 
-  const update: any = { status };
-  // إذا كانت حالة إرجاع أو إلغاء، خزّن السبب
-  if (status === "returned" || status === "cancelled") {
-    update.returnReason = reason || "بدون تحديد";
-    update.returnBy = returnBy || "admin"; // مثلاً "admin" أو "store" أو "driver" أو "customer"
-  } else {
-    // إزالة حقول الإرجاع إذا جرى تغيير إلى حالة أخرى
-    update.returnReason = undefined;
-    update.returnBy = undefined;
+  const update: any = {
+    $set: { status },
+    $push: {
+      statusHistory: { status, changedAt: new Date(), changedBy: "admin" },
+    },
+  };
+
+  if (status === "assigned") {
+    update.$set.assignedAt = new Date();
   }
 
-  const order = await DeliveryOrder.findById(req.params.id);
+  if (status === "returned" || status === "cancelled") {
+    update.$set.returnReason = reason || "بدون تحديد";
+    update.$set.returnBy = returnBy || "admin";
+  } else {
+    update.$unset = { returnReason: "", returnBy: "" };
+  }
+
+  const order = await DeliveryOrder.findByIdAndUpdate(
+    req.params.id,
+    update,
+    { new: true, runValidators: true, context: "query" }
+  );
+
   if (!order) {
     res.status(404).json({ message: "Order not found" });
     return;
   }
-
-  // تسجيل التاريخ
-  order.status = status as OrderStatus;
-  order.statusHistory.push({
-    status,
-    changedAt: new Date(),
-    changedBy: "admin",
-  });
-
-  // إدارة سبب الإرجاع/الإلغاء
-  if (status === "returned" || status === "cancelled") {
-    order.returnReason = reason || "بدون تحديد";
-    order.returnBy = returnBy || "admin";
-  } else {
-    order.returnReason = undefined;
-    order.returnBy = undefined;
+  if (status === "preparing") {
+    try {
+      // ابث عروض لأقرب 5
+      await broadcastOffersForOrder(order._id.toString(), 2); // 2 دقيقة صلاحية العرض
+    } catch (e) {
+      console.error("Broadcast offers error:", (e as Error).message);
+    }
+  }
+  // ⚠️ لا تعيد تعديل/حفظ الوثيقة هنا
+  try { await postIfDeliveredOnce(order); } catch (e) {
+    console.error("Accounting posting failed (adminChangeStatus):", (e as Error).message);
   }
 
-  await order.save();
+  broadcastOrder("order.status", order._id.toString(), {
+    status,
+    by: getActor(req).role,
+  });
+
   res.json(order);
-  return;
 };
+
 export const cancelOrder = async (req: Request, res: Response) => {
   try {
-    const firebaseUID = req.user?.id;
+    const firebaseUID = (req as any).firebaseUser?.uid;
     if (!firebaseUID) {
       res.status(401).json({ message: "Unauthorized" });
       return;
@@ -406,43 +781,93 @@ export const cancelOrder = async (req: Request, res: Response) => {
       return;
     }
 
-    // نجد الطلب ونتحقق من ملكيته
-    const order = await DeliveryOrder.findOne({
-      _id: orderId,
-      userId: user._id,
-    });
+    const order: any = await DeliveryOrder.findOne({ _id: orderId, user: user._id });
     if (!order) {
       res.status(404).json({ message: "Order not found or not yours" });
       return;
     }
 
-    // يمكن الإلغاء فقط في الحالات المسموح بها
-    if (!["pending_confirmation"].includes(order.status)) {
+    if (!canTransition(order.status, "cancelled")) {
       res.status(400).json({ message: "Cannot cancel at this stage" });
       return;
     }
 
-    order.status = "cancelled";
-    await order.save();
-
-    // (اختياري) إذا دفع بالـ wallet، أرجع المبلغ:
-    // if (order.paid && order.paymentMethod === "wallet") { ... }
-
+    pushStatusHistory(order, "cancelled", "customer", "User cancelled", "customer");
+    await order.save({ validateModifiedOnly: true }); 
     res.json({ message: "Order cancelled", order });
-    return;
   } catch (err: any) {
     res.status(500).json({ message: err.message });
-    return;
+  }
+};
+
+export const getOrderNotes = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const actor = getActor(req);
+    const scope = (req.query.visibility as string) || "auto"; // "public" | "internal" | "auto"
+    const sort = ((req.query.sort as string) || "asc").toLowerCase() as "asc" | "desc";
+
+    // العميل لا يُسمح له بقراءة ملاحظات طلب لا يملكه
+    let query: any = { _id: id };
+    if (actor.role === "customer") {
+      const firebaseUID = (req as any).firebaseUser?.uid;
+      const dbUser = await User.findOne({ firebaseUID }).select("_id");
+      if (!dbUser) {
+        res.status(401).json({ message: "Unauthorized" });
+        return;
+      }
+      query.user = dbUser._id;
+    }
+
+    const order: any = await DeliveryOrder.findOne(query).select("notes").lean();
+    if (!order) {
+      res.status(404).json({ message: "Order not found" });
+      return;
+    }
+
+    let notes = order.notes || [];
+
+    // فلترة بحسب الـvisibility المطلوبة
+    if (scope === "public") {
+      notes = notes.filter((n: any) => n.visibility === "public");
+    } else if (scope === "internal") {
+      if (actor.role === "customer") {
+        res.status(403).json({ message: "Forbidden" });
+        return;
+      }
+      notes = notes.filter((n: any) => n.visibility === "internal");
+    } else {
+      // auto: العميل يرى العامة فقط، والباقون يرون الكل
+      if (actor.role === "customer") {
+        notes = notes.filter((n: any) => n.visibility === "public");
+      }
+    }
+
+    // ترتيب
+    notes.sort((a: any, b: any) =>
+      sort === "asc"
+        ? new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+        : new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+    notes = sanitizeNotes(notes);
+
+    res.json(notes);
+  } catch (e: any) {
+    res.status(500).json({ message: e.message });
   }
 };
 
 export const getUserOrders = async (req: Request, res: Response) => {
   try {
     const { userId } = req.params;
-    const orders = await DeliveryOrder.find({ user: userId }).sort({ createdAt: -1 });
-    console.log("Request for orders of user:", userId);
-console.log("Found", orders.length, "orders");
-    res.json(orders);
+    const orders = await DeliveryOrder.find({ user: userId }).sort({ createdAt: -1 }).lean();
+    const actor = getActor(req);
+    const sanitized = orders.map(o => ({
+      ...o,
+      notes: actor.role === "customer" ? (o.notes || []).filter((n:any)=> n.visibility==="public") : o.notes
+    }));
+    res.json(sanitized);
+    
     
   } catch (error: any) {
     res.status(500).json({ message: error.message });
@@ -544,7 +969,7 @@ export const repeatOrder = async (req: Request, res: Response) => {
       price: totalPrice,
       companyShare: totalCompanyShare,
       platformShare: totalPlatformShare,
-      notes: oldOrder.notes,
+      notes: sanitizeNotes(oldOrder.notes),
       paymentMethod: oldOrder.paymentMethod,
       status: "pending_confirmation",
       paid: false,
@@ -568,10 +993,12 @@ export const repeatOrder = async (req: Request, res: Response) => {
 export const getOrderById = async (req: Request, res: Response) => {
   try {
     const order = await DeliveryOrder.findById(req.params.id)
-  .populate({ path: 'user', select: 'fullName phone' }) // اسم الحقل كما في السكيمة
-      .populate("storeId", "name")
-  .populate({ path: 'driver', select: 'fullName phone' }); // إذا احتجت بيانات السائق
-
+    .populate({ path: 'user', select: 'fullName name email phone' })
+    .populate({ path: 'driver', select: 'fullName phone' })
+    .populate({ path: 'subOrders.store', select: 'name logo address' })
+    .populate({ path: 'subOrders.driver', select: 'fullName phone' })
+    .populate({ path: 'items.store', select: 'name logo' });
+  
     if (!order) {
       res.status(404).json({ message: "الطلب غير موجود" });
       return;
@@ -583,81 +1010,103 @@ export const getOrderById = async (req: Request, res: Response) => {
 };
 export const getAllOrders = async (req: Request, res: Response) => {
   try {
-    const { status, city, storeId, driverId } = req.query;
-    const filter: any = {};
-    if (status) filter.status = status;
-    if (city) filter.city = city;
-    if (storeId) filter.storeId = storeId;
-    if (driverId) filter.driverId = driverId;
+    const { status, city, storeId, driverId, from, to, paymentMethod } = req.query as any;
+
+    const and: any[] = [];
+    if (status) and.push({ status });
+    if (city) and.push({ "address.city": city });
+    if (paymentMethod) and.push({ paymentMethod });
+
+    if (storeId) {
+      and.push({
+        $or: [
+          { "subOrders.store": storeId },
+          { "items.store": storeId },
+        ],
+      });
+    }
+
+    if (driverId) {
+      and.push({
+        $or: [
+          { driver: driverId },
+          { "subOrders.driver": driverId },
+        ],
+      });
+    }
+
+    if (from || to) {
+      const range: any = {};
+      if (from) range.$gte = new Date(from);
+      if (to) range.$lte = new Date(to);
+      and.push({ createdAt: range });
+    }
+
+    const filter = and.length ? { $and: and } : {};
 
     const orders = await DeliveryOrder.find(filter)
       .sort({ createdAt: -1 })
-  .populate({ path: 'user', select: 'fullName phone' }) // اسم الحقل كما في السكيمة
-      .populate("storeId", "name")
-  .populate({ path: 'driver', select: 'fullName phone' }); // إذا احتجت بيانات السائق
+      .populate({ path: "user", select: "fullName name email phone" })
+      .populate({ path: "driver", select: "fullName phone" })
+      .populate({ path: "subOrders.store", select: "name logo address" })
+      .populate({ path: "subOrders.driver", select: "fullName phone" })
+      .populate({ path: "items.store", select: "name logo" });
 
     res.json(orders);
   } catch (error: any) {
     res.status(500).json({ message: error.message });
   }
 };
+
 // تحديث الحالة - مخصص للسائق أو الأدمن فقط
 export const updateOrderStatus = async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { status } = req.body;
-    const allowed = [
-      "pending",
-      "assigned",
-      "delivering",
-      "delivered",
-      "cancelled",
-    ];
-
-    if (!allowed.includes(status)) {
-      res.status(400).json({ message: "حالة غير صحيحة" });
-      return;
-    }
-
-    const order = await DeliveryOrder.findByIdAndUpdate(
-      id,
-      { status },
-      { new: true }
-    );
-
-    if (!order) {
-      res.status(404).json({ message: "الطلب غير موجود" });
-      return;
-    }
-
-    const statusMap: Record<string, string> = {
-      assigned: "تم قبول طلبك وتسليمه للسائق",
-      delivering: "طلبك قيد التوصيل",
-      delivered: "تم تسليم الطلب بنجاح",
-      cancelled: "تم إلغاء طلبك",
+    const { status, reason, returnBy } = req.body as {
+      status: OrderStatus; reason?: string; returnBy?: string;
     };
 
-    const notif = {
+    const actor = getActor(req);
+    if (!["admin","driver","store"].includes(actor.role)) {
+       res.status(403).json({ message: "Forbidden" });
+       return;
+    }
+
+    const order: any = await DeliveryOrder.findById(id);
+    if (!order) {
+      res.status(404).json({ message: "Order not found" });
+      return;
+    }
+
+    if (!canTransition(order.status, status)) {
+      res.status(400).json({ message: `Invalid transition from ${order.status} to ${status}` });
+      return;
+    }
+    if (status === "assigned" && !order.assignedAt) order.assignedAt = new Date();
+
+    pushStatusHistory(order, status, actor.role as any, reason, returnBy as any);
+    await order.save();
+    try {
+      await postIfDeliveredOnce(order);
+    } catch (e) {
+      console.error("Accounting posting failed (updateOrderStatus):", (e as Error).message);
+    }
+    // إشعار مختصر (اختياري)
+    io.to(`user_${order.user.toString()}`).emit("notification", {
       title: `حالة الطلب #${order._id}`,
-      body: statusMap[order.status] || `حالة: ${order.status}`,
-      data: { orderId: order._id },
+      body: `الحالة: ${status}`,
+      data: { orderId: order._id.toString() },
       isRead: false,
       createdAt: new Date(),
-    };
-
-    // جلب الـuser نفسه من الـorder.userId
-    await User.findByIdAndUpdate(
-      order.user, // ObjectId هنا
-      { $push: { notificationsFeed: notif } }
-    );
-
-    // إرسال لحظياً لغرفة المستخدم التي أسميتَها user_<uid>
-    io.to(`user_${order.user.toString()}`).emit("notification", notif);
-
+    });
+    broadcastOrder("order.status", order._id.toString(), {
+      status,
+      by: getActor(req).role,
+    });
+    
     res.json(order);
-    return;
   } catch (error: any) {
     res.status(500).json({ message: error.message });
-    return;
   }
 };
+

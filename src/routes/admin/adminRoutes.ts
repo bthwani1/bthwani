@@ -217,17 +217,33 @@ router.patch("/users/:id/role", verifyFirebase, verifyAdmin, updateUserRole);
  *       500:
  *         description: خطأ في الخادم أثناء التحقق من الدور.
  */
-router.get("/check-role", verifyFirebase, (req: Request, res: Response) => {
-  if (!req.user?.uid) {
-    res.status(401).json({ message: "Unauthorized" });
+router.get("/check-role", verifyFirebase, async (req: Request, res: Response) => {
+  const firebaseUser = (req as any).firebaseUser;          // set by verifyFirebase
+  const uid = firebaseUser?.uid;                            // <-- هذا هو الحقل الصحيح
+  const email = firebaseUser?.email;
+
+  if (!uid) {
+    res.status(401).json({ message: "Unauthorized (no uid)" });
     return;
   }
-  User.findOne({ firebaseUID: req.user.id })
-    .then((user) => {
-      if (!user) return res.status(404).json({ message: "Not found" });
-      return res.json({ role: user.role });
+
+  try {
+    // ابحث بالمطابقة على firebaseUID أو البريد كخيار ثانٍ
+    const user = await User.findOne({
+      $or: [{ firebaseUID: uid }, { email }],
     })
-    .catch((err) => res.status(500).json({ error: err.message }));
+      .select("role firebaseUID email")
+      .lean();
+
+    if (!user) {
+      res.status(404).json({ message: "User not found" });
+      return;
+    }
+
+    res.json({ role: user.role });
+  } catch (e: any) {
+    res.status(500).json({ message: e.message || "Server error" });
+  }
 });
 
 /**

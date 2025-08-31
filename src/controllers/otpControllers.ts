@@ -8,11 +8,17 @@ export const sendEmailOTP = async (
   email: string,
   userId: string,
   purpose: string
-) => {
+): Promise<string> => {
   const code = await generateOTP({ userId, purpose, metadata: { email } });
-  
+
+  // في التطوير: لا تعتمد على SMTP
+  const channel = "smtp"; // default: smtp
+  if (channel !== "smtp") {
+    return code; // console/mock
+  }
+
   await sendOtpEmail(email, code);
-  
+  return code;
 };
 
 export const verifyOTP = async ({

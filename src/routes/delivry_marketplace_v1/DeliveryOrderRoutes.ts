@@ -10,7 +10,8 @@ import { driverDeliver, driverPickUp } from "../../controllers/delivry_Marketpla
 import { getDeliveryFee } from "../../controllers/delivry_Marketplace_V1/DeliveryCartController";
 import { rateOrder } from "../../controllers/delivry_Marketplace_V1/orderRating";
 import Vendor from "../../models/vendor_app/Vendor";
-import { verifyVendorJWT } from "../../middleware/verifyVendorJWT";
+import MerchantProduct from "../../models/mckathi/MerchantProduct";
+import DeliveryProduct from "../../models/delivry_Marketplace_V1/DeliveryProduct";
 
 const router = express.Router();
 
@@ -137,7 +138,7 @@ router.patch("/:id/driver-pickup", driverPickUp);
 router.patch("/:id/admin-status",verifyFirebase,verifyAdmin, controller.adminChangeStatus);
 router.patch("/:id/driver-deliver", driverDeliver);
 router.get(
-  "/vendor/orders",verifyVendorJWT,
+  "/vendor/orders",authVendor,
 
   async (req: Request, res: Response) => {
     try {
@@ -156,12 +157,58 @@ router.get(
       }
 
       // 3. جلب جميع الطلبات التي تحتوي على subOrder خاص بمتجر هذا التاجر
-  const orders = await Order.find({
+const orders = await Order.find({
   "subOrders.store": storeId
 })
-.populate("subOrders.store", "name logo address") // يظهر معلومات المتجر
-.sort({ createdAt: -1 })
+.populate("subOrders.store", "name logo address")
 .lean();
+const allMerchantProductIds = [];
+const allDeliveryProductIds = [];
+
+for (const order of orders) {
+  for (const sub of order.subOrders) {
+    for (const item of sub.items) {
+      if (item.productType === "merchantProduct")
+        allMerchantProductIds.push(item.product);
+      if (item.productType === "deliveryProduct")
+        allDeliveryProductIds.push(item.product);
+    }
+  }
+}
+const merchantProducts = await MerchantProduct.find({ _id: { $in: allMerchantProductIds } })
+  .select("price customImage product") // أضف product
+  .populate({ path: "product", select: "name" }) // جلب الاسم من ProductCatalog
+  .lean();
+const deliveryProducts = await DeliveryProduct.find({ _id: { $in: allDeliveryProductIds } })
+  .select("name price image")
+  .lean();
+
+// عمل index للنتائج:
+const merchantProductMap = Object.fromEntries(
+  merchantProducts.map(p => [
+    p._id.toString(),
+    {
+      ...p,
+      name: (typeof p.product === "object" && p.product && "name" in p.product)
+        ? p.product.name
+        : undefined
+    }
+  ])
+);
+const deliveryProductMap = Object.fromEntries(deliveryProducts.map(p => [p._id.toString(), p]));
+for (const order of orders) {
+  for (const sub of order.subOrders) {
+    for (const item of sub.items) {
+      if (item.productType === "merchantProduct") {
+(item as any).details = merchantProductMap[item.product.toString()] || null;
+      }
+      if (item.productType === "deliveryProduct") {
+      (item as any).details = deliveryProductMap[item.product.toString()] || null;
+      }
+    }
+  }
+}
+
 
       res.json(orders);
     } catch (err: any) {
@@ -271,7 +318,27 @@ router.get("/:id", controller.getOrderById);
  *       500:
  *         description: Server error while fetching orders.
  */
-router.get("/", verifyAdmin, controller.getAllOrders);
+router.get("/", verifyFirebase, verifyAdmin, controller.getAllOrders);
+
+
+// تعيين/تغيير سائق (طلب كامل)
+router.patch("/:id/assign-driver", verifyFirebase, verifyAdmin, controller.assignDriver);
+
+// تعيين/تغيير سائق (SubOrder)
+router.patch("/:orderId/sub-orders/:subId/assign-driver", verifyFirebase, verifyAdmin, controller.assignDriverToSubOrder);
+
+// تغيير حالة SubOrder
+router.patch("/:orderId/sub-orders/:subId/status", verifyFirebase, verifyAdmin, controller.updateSubOrderStatus);
+
+// POD للطلب الكامل
+router.patch("/:id/pod", verifyFirebase, verifyAdmin, controller.setOrderPOD);
+
+// POD للـ SubOrder
+router.patch("/:orderId/sub-orders/:subId/pod", verifyFirebase, verifyAdmin, controller.setSubOrderPOD);
+
+// ملاحظات
+router.post("/:id/notes", verifyFirebase, verifyAdmin, controller.addOrderNote);
+router.get("/:id/notes", verifyFirebase, verifyAdmin, controller.getOrderNotes);
 
 /**
  * @swagger

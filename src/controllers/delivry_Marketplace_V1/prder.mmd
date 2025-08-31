@@ -1,0 +1,65 @@
+%%{init: {"theme":"base","themeVariables":{"primaryBorderColor":"#1b5e20","lineColor":"#1b5e20","textColor":"#111","primaryColor":"#e8f5e9"}}}%%
+flowchart TD
+  classDef default fill:#e8f5e9,stroke:#1b5e20,stroke-width:1px,color:#111;
+  classDef db fill:#ede7f6,stroke:#5e35b1,stroke-width:1px;
+  classDef err fill:#ffebee,stroke:#b71c1c,stroke-width:1px;
+
+  A["بدء جلسة Mongo ومعاملة"] --> B{"مصادقة Firebase UID موجود؟"}
+  B -- "لا" --> E1["401 Unauthorized"]:::err
+  B -- "نعم" --> C["جلب المستخدم بواسطة firebaseUID"]:::db
+  C --> D["جلب سلة المستخدم"]:::db
+  D -->|فارغة| E2["السلة فارغة"]:::err
+  D -->|تحتوي عناصر| F["قراءة body: scheduledFor / addressId / paymentMethod / deliveryMode"]
+
+  F --> G{"scheduledFor في المستقبل؟"}
+  G -- "لا" --> E3["خطأ: الوقت يجب أن يكون مستقبلي"]:::err
+  G -- "نعم أو غير محدد" --> H["اختيار العنوان (المحدد أو الافتراضي)"]
+  H --> I{"العنوان صالح ويحتوي إحداثيات؟"}
+  I -- "لا" --> E4["خطأ: العنوان غير صالح"]:::err
+  I -- "نعم" --> J["تجميع عناصر السلة حسب المتجر"]
+
+  J --> K["جلب PricingStrategy"]:::db
+  K --> L{"deliveryMode = unified ؟"}
+  L -- "نعم" --> M["حساب مسافة متجر واحد -> عميل ثم الرسوم"]
+  L -- "لا (split)" --> N["حساب رسوم لكل متجر وجمعها"]
+  M --> O["deliveryFee جاهزة"]
+  N --> O
+
+  O --> P{"اختيار سائقين"}
+  P -- "unified" --> P1["إيجاد سائق نشط قريب من أول متجر (نطاق 5 كم)"]
+  P -- "split" --> P2["لكل متجر: إيجاد سائق نشط قريب (5 كم)"]
+  P1 --> Q
+  P2 --> Q
+
+  Q["بناء subOrders: العناصر + السائق (إن وُجد) + حالة مبدئية pending_confirmation"]
+    --> R["حساب companyShare / platformShare حسب عمولة المتجر"] 
+
+  R --> S["totalPrice = cart.total + deliveryFee"]
+  S --> T{"paymentMethod = wallet أو mixed ؟"}
+  T -- "نعم" --> U["walletUsed = min(balance, totalPrice)"]
+  T -- "لا" --> V["walletUsed = 0"]
+  U --> W["cashDue = totalPrice - walletUsed"]
+  V --> W
+
+  W --> X{"walletUsed > 0 ؟"}
+  X -- "نعم" --> Y["تخفيض رصيد المحفظة وحفظ المستخدم"]:::db
+  X -- "لا" --> Z["بدون خصم"]
+
+  Y --> AA
+  Z --> AA
+  AA{"cashDue > 0 ؟"}
+  AA -- "نعم" --> AB["finalPaymentMethod = mixed, paid = false"]
+  AA -- "لا" --> AC["finalPaymentMethod = wallet, paid = true"]
+
+  AB --> AD
+  AC --> AD
+  AD["إنشاء DeliveryOrder بكل التفاصيل والحالة pending_confirmation"]:::db
+  AD --> AE["حفظ الطلب وحذف السلة ثم commit"]:::db
+  AE --> AF["broadcastOrder(order.created) + إضافة إشعار في User + Socket.IO"] 
+  AF --> AG["201 Created: إرجاع الطلب"]
+
+  %% أخطاء عامة
+  E1 -.-> X1["إنهاء المعاملة"]
+  E2 -.-> X1
+  E3 -.-> X1
+  E4 -.-> X1

@@ -36,6 +36,7 @@ import deliveryBannerRoutes from "./routes/delivry_marketplace_v1/DeliveryBanner
 import DeliveryOfferRoutes from "./routes/delivry_marketplace_v1/DeliveryOfferRoutes";
 import deliveryCartRouter from "./routes/delivry_marketplace_v1/DeliveryCartRoutes";
 import deliveryOrderRoutes from "./routes/delivry_marketplace_v1/DeliveryOrderRoutes";
+import DeliveryOrder from "./models/delivry_Marketplace_V1/Order"; // أعلى الملف
 
 import StatestoreRoutes from "./routes/admin/storeStatsRoutes";
 import employeeRoutes from "./routes/er/employee.routes";
@@ -47,6 +48,27 @@ import deliveryPromotionRoutes from "./routes/delivry_marketplace_v1/promotion.r
 import groceriesRoutes from "./routes/marchent/api";
 import storeSectionRoutes from "./routes/delivry_marketplace_v1/storeSection.routes";
 import chartAccountRoutes from "./routes/er/chartAccount.routes";
+import journalEntryRouter from "./routes/er/journalEntry.routes";
+import journalBookRouter from "./routes/er/journals.routes";
+import marketingRouter from "./routes/marketing";
+import pushRouter from "./push";
+import { initIndexesAndValidate } from "./bootstrap/indexes";
+import { registerRoasCron } from "./cron/roas";
+import { registerAdSpendCron } from "./cron/adspend";
+import dayjs from "dayjs";
+import utc from "dayjs/plugin/utc";
+import tz from "dayjs/plugin/timezone";
+import passwordResetRouter from "./routes/passwordReset";
+import favoritesRoutes from "./routes/favorites";
+import marketerStoreVendorRoutes from "./routes/marketerV1/marketerStoreVendorRoutes";
+import marketerOverviewRoutes from "./routes/marketerV1/marketerOverviewRoutes";
+import adminVendorModeration from "./routes/admin/vendorModerationRoutes";
+import adminOnboarding from "./routes/admin/onboardingRoutes";
+import adminCommission from "./routes/admin/commissionPlansRoutes";
+import adminReports from "./routes/admin/reportsRoutes";
+
+import adminMarketers from "./routes/admin/marketersRoutes";
+import adminStoreModeration from "./routes/admin/storeModerationRoutes";
 
 dotenv.config();
 
@@ -57,7 +79,9 @@ export const io = new IOServer(server, {
     origin: "*",
   },
 });
-
+dayjs.extend(utc); dayjs.extend(tz);
+dayjs.tz.setDefault("Asia/Aden");
+process.env.TZ = "Asia/Aden";
 // Middleware for Socket.IO verification
 io.use(verifyTokenSocket);
 io.on("connection", (socket) => {
@@ -72,12 +96,61 @@ io.on("connection", (socket) => {
     }
   });
 });
+io.on("connection", (socket) => {
+  const uid = socket.data.uid;
+  const role = socket.data.role;
 
+  // يبقى كما هو:
+  if (uid) socket.join(`user_${uid}`);
+
+  // 1) غرفة الأدمن العامة
+  socket.on("admin:subscribe", () => {
+    if (role === "admin" || role === "superadmin") {
+      socket.join("orders_admin");
+    }
+  });
+  socket.on("admin:unsubscribe", () => {
+    socket.leave("orders_admin");
+  });
+
+  // 2) غرفة طلب محدد
+  socket.on("order:subscribe", async ({ orderId }: { orderId: string }) => {
+    if (!orderId) return;
+    try {
+      const order = await DeliveryOrder.findById(orderId)
+        .select("user driver subOrders.store subOrders.driver")
+        .lean();
+      if (!order) return;
+
+      const isAdmin = role === "admin" || role === "superadmin";
+      const isOwner = socket.data.userId && order.user?.toString() === socket.data.userId;
+
+      // (اختياري) توسعة: السماح للسائق/التاجر — تحتاج vendorId/driverId على socket.data
+      // const isOrderDriver = socket.data.driverId && order.driver?.toString() === socket.data.driverId;
+      // const isSubDriver = socket.data.driverId && (order.subOrders || []).some(s => String(s.driver) === socket.data.driverId);
+      // const isStore = socket.data.vendorId && (order.subOrders || []).some(s => /* تحقق ملكية المتجر */);
+
+      if (isAdmin || isOwner /* || isOrderDriver || isSubDriver || isStore */) {
+        socket.join(`order_${orderId}`);
+      }
+    } catch {
+      /* تجاهل */
+    }
+  });
+
+  socket.on("order:unsubscribe", ({ orderId }: { orderId: string }) => {
+    if (orderId) socket.leave(`order_${orderId}`);
+  });
+
+  socket.on("disconnect", () => {
+    if (uid) socket.leave(`user_${uid}`);
+  });
+});
 // تفعيل CORS
 app.use(
   cors({
     origin: "*", // أو حدد نطاق فرونتك فقط مثل: "https://your-app.onrender.com"
-    methods: ["GET", "POST", "PUT", "DELETE"],
+    methods: ["GET", "POST", "PUT", "DELETE","PATCH"],
     credentials: true,
   })
 );
@@ -90,6 +163,7 @@ app.use((req, _res, next) => {
 
 // دعم JSON في الطلبات
 app.use(express.json());
+initIndexesAndValidate();
 
 // إعداد Swagger Document مع تضمين basePath عبر تعديل خاصية servers
 const API_PREFIX = "/api/v1";
@@ -115,6 +189,9 @@ app.use(`${API_PREFIX}/accounts/chart`, chartAccountRoutes);
 app.use(`${API_PREFIX}/admin/notifications`, adminNotificationRoutes);
 // قسم شحن المحفظة
 app.use(`${API_PREFIX}/topup`, topupRoutes);
+app.use(`${API_PREFIX}/entries`, journalEntryRouter);
+app.use(`${API_PREFIX}/accounts`, chartAccountRoutes);
+app.use(`${API_PREFIX}/journals`, journalBookRouter);
 
 // قسم الأدمن وإدارة المنتجات
 app.use(`${API_PREFIX}/admin`, adminRoutes);
@@ -134,8 +211,20 @@ app.use(`${API_PREFIX}/delivery/subcategories`, deliverySubCategoryRoutes);
 app.use(`${API_PREFIX}/delivery/banners`, deliveryBannerRoutes);
 app.use(`${API_PREFIX}/delivery/promotions`, deliveryPromotionRoutes);
 app.use(`${API_PREFIX}/delivery/sections`, storeSectionRoutes);
-
+app.use(`${API_PREFIX}`, passwordResetRouter);
+app.use(`${API_PREFIX}/favorites`, favoritesRoutes);
 app.use(`${API_PREFIX}/groceries`, groceriesRoutes);
+
+app.use(`${API_PREFIX}/push`, pushRouter);
+
+app.use(`${API_PREFIX}/`, marketerStoreVendorRoutes);
+app.use(`${API_PREFIX}/`, marketerOverviewRoutes);
+app.use(`${API_PREFIX}/`, adminVendorModeration);
+app.use(`${API_PREFIX}/`, adminOnboarding);
+app.use(`${API_PREFIX}/`, adminCommission);
+app.use(`${API_PREFIX}/`, adminReports);
+app.use(`${API_PREFIX}/`, adminMarketers);
+app.use(`${API_PREFIX}/`, adminStoreModeration);
 
 // قسم طلبات وسائق التوصيل
 app.use(`${API_PREFIX}/deliveryapp/withdrawals`, driverWithdrawalRoutes);
@@ -143,6 +232,7 @@ app.use(`${API_PREFIX}/deliveryapp/withdrawals`, driverWithdrawalRoutes);
 // قسم التاجر
 app.use(`${API_PREFIX}/vendor`, vendorRoutes);
 app.use(`${API_PREFIX}/pricing-strategies`, pricingStrategyRoutes);
+app.use('/api/v1', marketingRouter);
 
 // قسم الوظائف والمستقلين
 
@@ -178,5 +268,7 @@ const startServer = async () => {
     process.exit(1);
   }
 };
+registerAdSpendCron();
+registerRoasCron();
 
 startServer();

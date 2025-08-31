@@ -6,8 +6,8 @@ import driverReviewModel from "../../models/Driver_app/driverReview.model";
 export const getDeliveryKPIs = async (req: Request, res: Response) => {
   // 1) إجمالي عدد الطلبات حسب اليوم/الأسبوع/الشهر
   const now = new Date();
-  const startOfDay   = new Date(now.setHours(0,0,0,0));
-  const startOfWeek  = new Date(startOfDay);
+  const startOfDay = new Date(now.setHours(0, 0, 0, 0));
+  const startOfWeek = new Date(startOfDay);
   startOfWeek.setDate(startOfWeek.getDate() - startOfWeek.getDay());
   const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
 
@@ -22,7 +22,7 @@ export const getDeliveryKPIs = async (req: Request, res: Response) => {
   const totalOrders = await Order.countDocuments();
   const onTimeCount = await Order.countDocuments({
     status: "delivered",
-    $expr: { $lte: ["$deliveredAt", "$expectedDeliveryAt"] }
+    $expr: { $lte: ["$deliveredAt", "$expectedDeliveryAt"] },
   });
   const onTimeRate = totalOrders ? (onTimeCount / totalOrders) * 100 : 0;
 
@@ -30,7 +30,7 @@ export const getDeliveryKPIs = async (req: Request, res: Response) => {
   const avgDeliveryTimeAgg = await Order.aggregate([
     { $match: { status: "delivered" } },
     { $project: { diff: { $subtract: ["$deliveredAt", "$createdAt"] } } },
-    { $group: { _id: null, avgMs: { $avg: "$diff" } } }
+    { $group: { _id: null, avgMs: { $avg: "$diff" } } },
   ]);
   const avgDeliveryTimeMs = avgDeliveryTimeAgg[0]?.avgMs || 0;
 
@@ -38,33 +38,51 @@ export const getDeliveryKPIs = async (req: Request, res: Response) => {
   const [totalCommission, revenueByStore] = await Promise.all([
     Order.aggregate([
       { $match: { status: "delivered" } },
-      { $group: { _id: null, total: { $sum: "$cost" } } }
+      { $group: { _id: null, total: { $sum: "$cost" } } },
     ]),
     Order.aggregate([
       { $match: { status: "delivered" } },
-      { $group: { _id: "$storeId", revenue: { $sum: "$cost" } } }
-    ])
+      { $group: { _id: "$storeId", revenue: { $sum: "$cost" } } },
+    ]),
   ]);
 
   // 5) مؤشرات السائقين:
   // متوسط تقييم السائقين
   const driverRatings = await driverReviewModel.aggregate([
-    { $group: { _id: "$driverId", avgRating: { $avg: "$rating" }, count: { $sum: 1 } } }
+    {
+      $group: {
+        _id: "$driverId",
+        avgRating: { $avg: "$rating" },
+        count: { $sum: 1 },
+      },
+    },
   ]);
 
   // عدد الطلبات المنجزة ونسبة الإلغاء لكل سائق
   const driverStats = await Order.aggregate([
-    { $group: {
+    {
+      $group: {
         _id: "$driverId",
-        completed: { $sum: { $cond: [{ $eq: ["$status", "delivered"] }, 1, 0] } },
-        canceled:  { $sum: { $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0] } }
-    }}
+        completed: {
+          $sum: { $cond: [{ $eq: ["$status", "delivered"] }, 1, 0] },
+        },
+        canceled: {
+          $sum: { $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0] },
+        },
+      },
+    },
   ]);
 
-   res.json({
-    orders: { dailyCount, weeklyCount, monthlyCount, onTimeRate, avgDeliveryTimeMs },
+  res.json({
+    orders: {
+      dailyCount,
+      weeklyCount,
+      monthlyCount,
+      onTimeRate,
+      avgDeliveryTimeMs,
+    },
     revenue: { total: totalCommission[0]?.total || 0, byStore: revenueByStore },
-    drivers: { ratings: driverRatings, stats: driverStats }
+    drivers: { ratings: driverRatings, stats: driverStats },
   });
   return;
 };

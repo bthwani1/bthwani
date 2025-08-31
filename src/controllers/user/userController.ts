@@ -1,83 +1,127 @@
 import { Request, Response } from "express";
 import { User } from "../../models/user";
-
+function isValidGeoPoint(p: any) {
+  return (
+    p &&
+    p.type === "Point" &&
+    Array.isArray(p.coordinates) &&
+    p.coordinates.length === 2 &&
+    typeof p.coordinates[0] === "number" &&
+    typeof p.coordinates[1] === "number"
+  );
+}
 export const registerOrUpdateUser = async (req: Request, res: Response) => {
-  if (!req.user?.uid) {
+  const fb: any = (req as any).firebaseUser || (req as any).user;
+  if (!fb?.uid) {
     res.status(401).json({ message: "Unauthorized" });
     return;
   }
 
-  const { uid, email } = req.user;
-  const body = { ...req.body }; // انسخ الجسم
+  const uid = fb.uid;
+  const email = (fb.email || "").trim().toLowerCase(); // 👈 توحيد الإيميل
+  const body = { ...req.body };
+  const fullName = (body.fullName || "مستخدم").toString().trim();
 
-  const name = body.fullName || "مستخدم";
+  // لا تثق بإيميل العميل في الجسم — استخدم المصدَّق من التوكن
+  delete (body as any).email;
 
-  // 🧹 تنظيف donationLocation من جسم الطلب إذا لم يكن GeoJSON صالح
-  const isValidGeoPoint =
-    body.donationLocation &&
-    body.donationLocation.type === "Point" &&
-    Array.isArray(body.donationLocation.coordinates) &&
-    body.donationLocation.coordinates.length === 2 &&
-    typeof body.donationLocation.coordinates[0] === "number" &&
-    typeof body.donationLocation.coordinates[1] === "number";
-
-  if (!isValidGeoPoint) {
-    delete body.donationLocation;
+  // نظّف الـ donationLocation
+  if (!isValidGeoPoint((body as any).donationLocation)) {
+    delete (body as any).donationLocation;
   }
 
   try {
+    // 1) ابحث بالـ firebaseUID
     let user = await User.findOne({ firebaseUID: uid });
-if (user && !user.emailVerified) {
-  res.status(403).json({ message: "يجب تأكيد البريد الإلكتروني أولًا" });
-  return;
-}
+
+    // 2) إن لم يوجد، ابحث بالإيميل
+    if (!user && email) {
+      user = await User.findOne({ email: email });
+      if (user) {
+        if (!user.firebaseUID) {
+          // اربط الحساب الموجود بملف Firebase الجديد
+          user.firebaseUID = uid;
+        } else if (user.firebaseUID !== uid) {
+          // هذا البريد مربوط بحساب Firebase آخر
+           res
+            .status(409)
+            .json({ message: "هذا البريد مرتبط بحساب آخر. سجّل الدخول.", code: "EMAIL_LINK_CONFLICT" });
+            return;
+        }
+      }
+    }
+
+    // 3) أنشئ أو حدّث
     if (!user) {
-      // مستخدم جديد
       user = new User({
-        fullName: name,
+        fullName,
         email,
         firebaseUID: uid,
         ...body,
       });
-    } else {
-      // تحديث مستخدم حالي
-      Object.assign(user, body);
-
-      // 🔒 تنظيف donationLocation القديم إذا كان غير صالح
-      const loc = user.donationLocation;
-      if (
-        loc &&
-        (loc.type !== "Point" ||
-          !Array.isArray(loc.coordinates) ||
-          loc.coordinates.length !== 2 ||
-          typeof loc.coordinates[0] !== "number" ||
-          typeof loc.coordinates[1] !== "number")
-      ) {
-        user.donationLocation = undefined;
+    } else {  
+      // ⚠️ لا نستبدل الاسم الموجود إلا إذا كان فارغًا/افتراضيًا
+      if (fullName && fullName !== "مستخدم" &&
+          (!user.fullName || user.fullName === "مستخدم")) {
+        user.fullName = fullName;
       }
-    }
-    console.log("🔍 user.toObject():", user.toObject());
+  
+      // مثال آمن للهاتف: لا تسقط الموجود بقيمة افتراضية
+      if (typeof body.phone !== "undefined" && !user.phone) {
+        user.phone = body.phone;
+      }
 
-    console.log("🔍 User to be saved:", user);
-    await user.save();
-    res.status(200).json(user);
+      if (isValidGeoPoint((body as any).donationLocation)) {
+        (user as any).donationLocation = (body as any).donationLocation;
+      }
+      // لا تغيّر email هنا إلا لو كان فارغًا في السجل
+      if (!user.email && email) user.email = email;
+    }
+
+    const saved = await user.save();
+     res.status(200).json(saved);
+     return;
   } catch (err: any) {
-    console.error("❌ Error saving user:", err.message);
-    if (err.name === "ValidationError") {
-      for (let field in err.errors) {
-        console.error(
-          `📛 Validation error on '${field}':`,
-          err.errors[field].message
-        );
+    // معالجة تكرار الإيميل كتعامل منطقي وليس 500
+    if (err?.code === 11000 && err?.keyPattern?.email) {
+      // جرّب ربط الحساب الموجود بالإيميل مع uid الحالي إن لم يكن مربوطًا
+      const existing = await User.findOne({ email });
+      if (existing) {
+        if (!existing.firebaseUID || existing.firebaseUID === uid) {
+          existing.firebaseUID = uid;
+          if (fullName) existing.fullName = fullName;
+          if (typeof (body as any).phone !== "undefined") existing.phone = (body as any).phone;
+          if (isValidGeoPoint((body as any).donationLocation)) {
+            (existing as any).donationLocation = (body as any).donationLocation;
+          }
+          const saved = await existing.save();
+           res.status(200).json(saved);
+           return;
+        }
+         res
+          .status(409)
+          .json({ message: "هذا البريد مستخدم من حساب آخر.", code: "EMAIL_TAKEN" });
+          return;
       }
-    } else {
-      console.error("📛 Unknown error:", err);
     }
 
-    res.status(500).json({ message: "Error saving user", error: err.message });
+    console.error("❌ Error saving user:", err);
+     res.status(500).json({ message: "Error saving user", error: err?.message });
+     return;
   }
 };
-
+export const searchUsers = async (req: Request, res: Response) => {
+  const q = (req.query.q as string) || "";
+  const limit = Math.min(parseInt((req.query.limit as string) || "20"), 50);
+  const regex = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+  const users = await User.find({
+    $or: [{ fullName: regex }, { name: regex }, { phone: { $regex: q, $options: "i" } }],
+  })
+    .select("_id fullName name phone")
+    .limit(limit)
+    .lean();
+  res.json(users);
+};
 export const getCurrentUser = async (req: Request, res: Response) => {
   try {
     if (!req.user?.uid) {
