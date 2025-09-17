@@ -1,107 +1,179 @@
 import { Request, Response } from "express";
 import { Types } from "mongoose";
 import Favorite, { FavoriteType } from "../models/Favorite";
-import { User } from "../models/user"; 
+import { User } from "../models/user";
 import DeliveryStore from "../models/delivry_Marketplace_V1/DeliveryStore";
 import DeliveryProduct from "../models/delivry_Marketplace_V1/DeliveryProduct";
 
 // ------ Helpers ------
-const isValidObjectId = (v: any) => typeof v === "string" && Types.ObjectId.isValid(v);
+const isValidObjectId = (v: any) =>
+  typeof v === "string" && Types.ObjectId.isValid(v);
 const toObjectId = (v: string, field = "id") => {
   if (!isValidObjectId(v)) throw new Error(`Invalid ${field}`);
   return new Types.ObjectId(v);
 };
 
 function normalizeItemType(v: any): FavoriteType {
-    const t = String(v ?? "").toLowerCase().trim();
-    if (t === "product") return "product";
-    if (["restaurant", "grocery", "store", "merchant"].includes(t)) return "restaurant";
-    throw new Error("Invalid itemType");
-  }
-  
+  const t = String(v ?? "")
+    .toLowerCase()
+    .trim();
+  if (t === "product") return "product";
+  if (["restaurant", "grocery", "store", "merchant"].includes(t))
+    return "restaurant";
+  throw new Error("Invalid itemType");
+}
 
 /** يحوّل Firebase UID إلى User._id (ObjectId). يقرأ من verifyFirebase: req.user.id */
 async function getUserMongoId(req: Request) {
-    const cached = (req as any).userMongoId;
-    if (cached && Types.ObjectId.isValid(String(cached))) return new Types.ObjectId(String(cached));
-    const uid = (req as any)?.user?.id || (req as any)?.user?.uid;
-    if (!uid) throw new Error("Unauthorized: missing uid");
-    if (Types.ObjectId.isValid(uid)) {
-      const objId = new Types.ObjectId(uid);
-      (req as any).userMongoId = objId;
-      return objId;
-    }
-    const userDoc = await User.findOne({ firebaseUID: uid }).select("_id").lean();
-    if (!userDoc?._id) throw new Error("User not found for provided uid");
-    const objId = new Types.ObjectId(String(userDoc._id));
+  const cached = (req as any).userMongoId;
+  if (cached && Types.ObjectId.isValid(String(cached)))
+    return new Types.ObjectId(String(cached));
+  const uid = (req as any)?.user?.id || (req as any)?.user?.uid;
+  if (!uid) throw new Error("Unauthorized: missing uid");
+  if (Types.ObjectId.isValid(uid)) {
+    const objId = new Types.ObjectId(uid);
     (req as any).userMongoId = objId;
     return objId;
   }
+  const userDoc = await User.findOne({ firebaseUID: uid }).select("_id").lean();
+  if (!userDoc?._id) throw new Error("User not found for provided uid");
+  const objId = new Types.ObjectId(String(userDoc._id));
+  (req as any).userMongoId = objId;
+  return objId;
+}
 
 // ------ Controllers ------
 
 // GET /api/v1/favorites?type=product|restaurant
 export async function listFavorites(req: Request, res: Response) {
-    try {
-      const userId = await getUserMongoId(req);
-      const typeParam = req.query.type as any | undefined;
-  
-      const q: any = { user: userId };
-      if (typeParam) q.itemType = normalizeItemType(typeParam);
-  
-      const favs = await Favorite.find(q).lean();
-  
-      console.log("[favorites:list] userId =", userId.toString());
-      console.log("[favorites:list] count =", favs.length);
-  
-      // ✅ backfill للّقطات المفقودة (العناصر القديمة)
-      const backfilled = await Promise.all(
-        favs.map(async (f) => {
-          if (f?.itemSnapshot && Object.keys(f.itemSnapshot).length) return f;
-  
-          try {
-            if (f.itemType === "restaurant") {
-              const s = await DeliveryStore.findById(f.item).select("name logo image rating").lean();
-              if (s) f.itemSnapshot = { title: s.name, image: s.logo || s.image, rating: s.rating };
-            } else {
-              const p = await DeliveryProduct.findById(f.item).select("name image price rating").lean();
-              if (p) f.itemSnapshot = { title: p.name, image: p.image, price: p.price, rating: (p as any).rating };
-            }
-          } catch {
-            // تجاهل أي خطأ في التعبئة
+  try {
+    const userId = await getUserMongoId(req);
+    const typeParam = req.query.type as any | undefined;
+
+    const q: any = { user: userId };
+    if (typeParam) q.itemType = normalizeItemType(typeParam);
+
+    const favs = await Favorite.find(q).lean();
+
+    console.log("[favorites:list] userId =", userId.toString());
+    console.log("[favorites:list] count =", favs.length);
+
+    // ✅ backfill للّقطات المفقودة (العناصر القديمة)
+    const backfilled = await Promise.all(
+      favs.map(async (f) => {
+        if (f?.itemSnapshot && Object.keys(f.itemSnapshot).length) return f;
+        if (f.itemType === "product") {
+          const needsStoreMeta =
+            !f?.itemSnapshot?.storeId || !f?.itemSnapshot?.storeType;
+
+          if (
+            !f?.itemSnapshot ||
+            Object.keys(f.itemSnapshot).length === 0 ||
+            needsStoreMeta
+          ) {
+            try {
+              const p = await DeliveryProduct.findById(f.item)
+                .select("name image price rating store storeId")
+                .lean();
+
+              if (p) {
+                const inferredStoreId =
+                  (p as any)?.store || (p as any)?.storeId;
+                f.itemSnapshot = {
+                  ...(f.itemSnapshot || {}),
+                  title: f.itemSnapshot?.title ?? p.name,
+                  image: f.itemSnapshot?.image ?? p.image,
+                  price:
+                    typeof f.itemSnapshot?.price === "number"
+                      ? f.itemSnapshot.price
+                      : p.price,
+                  rating:
+                    typeof f.itemSnapshot?.rating === "number"
+                      ? f.itemSnapshot.rating
+                      : (p as any).rating,
+                  storeId:
+                    f.itemSnapshot?.storeId ||
+                    (inferredStoreId
+                      ? (String(inferredStoreId) as any)
+                      : undefined),
+                  // لو عندك تمييز فعلي املأه، وإلا احتفظ بـ 'restaurant' كافتراضي لهذا الموديل
+                  storeType: f.itemSnapshot?.storeType || "restaurant",
+                };
+
+                // (اختياري) احفظ الـ backfill في DB لتقليل استعلامات المستقبل:
+                // await Favorite.updateOne({ _id: f._id }, { $set: { itemSnapshot: f.itemSnapshot } });
+              }
+            } catch {}
           }
-          return f;
-        })
-      );
-  
-      // دعم رد مسطّح للفرونت إن حبيت
-      if ((req.query.flat as string) === "1") {
-        const flat = backfilled.map((f) => ({
-          _id: String(f._id ?? ""),
-          itemId: String(f.item ?? ""),
-          itemType: f.itemType as FavoriteType,
-          userId: f.user ? String(f.user) : undefined,
-          title: f.itemSnapshot?.title,
-          image: f.itemSnapshot?.image,
-          price: typeof f.itemSnapshot?.price === "number" ? f.itemSnapshot.price : undefined,
-          rating: typeof f.itemSnapshot?.rating === "number" ? f.itemSnapshot.rating : undefined,
-          createdAt: f.createdAt ? new Date(f.createdAt).toISOString() : undefined,
-        }));
-         res.json(flat); // ⬅️ مهم: return
-         return
-      }
-  
-      res.json(backfilled); // ⬅️ مهم: return
-      return
-    } catch (e: any) {
-      console.error("[favorites:list] ", e?.message || e);
-      if (!res.headersSent) {
-        res.status(400).json({ message: e?.message || "Failed to list favorites" });
-        return
-      }
-      // لو الرد أُرسل، لا تحاول إرسال ثانيًا.
+        }
+        try {
+          if (f.itemType === "restaurant") {
+            const s = await DeliveryStore.findById(f.item)
+              .select("name logo image rating")
+              .lean();
+            if (s)
+              f.itemSnapshot = {
+                title: s.name,
+                image: s.logo || s.image,
+                rating: s.rating,
+              };
+          } else {
+            const p = await DeliveryProduct.findById(f.item)
+              .select("name image price rating")
+              .lean();
+            if (p)
+              f.itemSnapshot = {
+                title: p.name,
+                image: p.image,
+                price: p.price,
+                rating: (p as any).rating,
+              };
+          }
+        } catch {
+          // تجاهل أي خطأ في التعبئة
+        }
+        return f;
+      })
+    );
+
+    // دعم رد مسطّح للفرونت إن حبيت
+    if ((req.query.flat as string) === "1") {
+      const flat = backfilled.map((f) => ({
+        _id: String(f._id ?? ""),
+        itemId: String(f.item ?? ""),
+        itemType: f.itemType as FavoriteType,
+        userId: f.user ? String(f.user) : undefined,
+        title: f.itemSnapshot?.title,
+        image: f.itemSnapshot?.image,
+        price:
+          typeof f.itemSnapshot?.price === "number"
+            ? f.itemSnapshot.price
+            : undefined,
+        rating:
+          typeof f.itemSnapshot?.rating === "number"
+            ? f.itemSnapshot.rating
+            : undefined,
+        createdAt: f.createdAt
+          ? new Date(f.createdAt).toISOString()
+          : undefined,
+      }));
+      res.json(flat); // ⬅️ مهم: return
+      return;
     }
+
+    res.json(backfilled); // ⬅️ مهم: return
+    return;
+  } catch (e: any) {
+    console.error("[favorites:list] ", e?.message || e);
+    if (!res.headersSent) {
+      res
+        .status(400)
+        .json({ message: e?.message || "Failed to list favorites" });
+      return;
+    }
+    // لو الرد أُرسل، لا تحاول إرسال ثانيًا.
   }
+}
 
 // POST /api/v1/favorites   body: { itemId, itemType, itemSnapshot? }
 export async function addFavorite(req: Request, res: Response) {
@@ -110,7 +182,15 @@ export async function addFavorite(req: Request, res: Response) {
     const { itemId, itemSnapshot } = req.body as {
       itemId: string;
       itemType: FavoriteType | string;
-      itemSnapshot?: { title?: string; image?: string; price?: number; rating?: number };
+      itemSnapshot?: {
+        title?: string;
+        image?: string;
+        price?: number;
+        rating?: number;
+        // 👇 جديد
+        storeId?: string;
+        storeType?: "grocery" | "restaurant";
+      };
     };
     const itemType = normalizeItemType((req.body as any).itemType);
 
@@ -118,19 +198,46 @@ export async function addFavorite(req: Request, res: Response) {
     const item = toObjectId(itemId, "itemId");
 
     let snapshot = itemSnapshot;
+    // داخل addFavorite: في فرع itemType === 'product'
     if (!snapshot) {
       if (itemType === "restaurant") {
-        const s = await DeliveryStore.findById(item).select("name logo image rating").lean();
-        if (s) snapshot = { title: s.name, image: s.logo || s.image, rating: s.rating as any };
+        const s = await DeliveryStore.findById(item)
+          .select("name logo image rating")
+          .lean();
+        if (s)
+          snapshot = {
+            title: s.name,
+            image: s.logo || s.image,
+            rating: s.rating as any,
+          };
       } else {
-        const p = await DeliveryProduct.findById(item).select("name image price rating").lean();
-        if (p) snapshot = { title: p.name, image: p.image, price: p.price, rating: (p as any).rating };
+        const p = await DeliveryProduct.findById(item)
+          .select("name image price rating store storeId")
+          .lean();
+        if (p) {
+          const inferredStoreId = (p as any)?.store || (p as any)?.storeId;
+          snapshot = {
+            title: p.name,
+            image: p.image,
+            price: p.price,
+            rating: (p as any).rating,
+            // 👇 قد تكون undefined إن لم تتوفر في السكيمة—لا تؤثر
+            storeId: inferredStoreId
+              ? (String(inferredStoreId) as any)
+              : undefined,
+            // إن كنت تعرف أن DeliveryProduct هذا خاص بالمطاعم، ثبّت 'restaurant'
+            storeType: "restaurant",
+          };
+        }
       }
     }
 
     const fav = await Favorite.findOneAndUpdate(
       { user: userId, item, itemType },
-      { $setOnInsert: { user: userId, item, itemType }, ...(snapshot ? { $set: { itemSnapshot: snapshot } } : {}) },
+      {
+        $setOnInsert: { user: userId, item, itemType },
+        ...(snapshot ? { $set: { itemSnapshot: snapshot } } : {}),
+      },
       { upsert: true, new: true }
     ).lean();
 
@@ -148,16 +255,22 @@ export async function removeFavorite(req: Request, res: Response) {
     const itemType = normalizeItemType(req.params.itemType);
     const item = toObjectId(req.params.itemId, "itemId");
 
-    const del = await Favorite.findOneAndDelete({ user: userId, item, itemType }).lean();
+    const del = await Favorite.findOneAndDelete({
+      user: userId,
+      item,
+      itemType,
+    }).lean();
     if (!del) {
       res.status(404).json({ message: "Favorite not found" });
-      return
+      return;
     }
 
     res.json({ ok: true });
   } catch (e: any) {
     console.error("[favorites:remove] ", e?.message || e);
-    res.status(400).json({ message: e?.message || "Failed to remove favorite" });
+    res
+      .status(400)
+      .json({ message: e?.message || "Failed to remove favorite" });
   }
 }
 
@@ -183,10 +296,17 @@ export async function counts(req: Request, res: Response) {
     const type = normalizeItemType(req.query.type);
     const idsParam = (req.query.ids as string) || "";
 
-    const ids = idsParam.split(",").map((s) => s.trim()).filter(Boolean);
+    const ids = idsParam
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
     const objIds = ids.map((id) => toObjectId(id, "ids[]"));
 
-    const favs = await Favorite.find({ user: userId, itemType: type, item: { $in: objIds } })
+    const favs = await Favorite.find({
+      user: userId,
+      itemType: type,
+      item: { $in: objIds },
+    })
       .select("item")
       .lean();
 

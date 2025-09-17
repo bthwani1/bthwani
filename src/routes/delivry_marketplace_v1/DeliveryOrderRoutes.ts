@@ -12,6 +12,7 @@ import { rateOrder } from "../../controllers/delivry_Marketplace_V1/orderRating"
 import Vendor from "../../models/vendor_app/Vendor";
 import MerchantProduct from "../../models/mckathi/MerchantProduct";
 import DeliveryProduct from "../../models/delivry_Marketplace_V1/DeliveryProduct";
+import { createErrandOrder } from "../../controllers/delivry_Marketplace_V1/AkhdimniController";
 
 const router = express.Router();
 
@@ -217,6 +218,7 @@ for (const order of orders) {
   }
 );
 
+router.post("/errand", verifyFirebase, createErrandOrder);
 
 router.get("/fee", getDeliveryFee);
 

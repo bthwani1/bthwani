@@ -66,7 +66,7 @@ import adminVendorModeration from "./routes/admin/vendorModerationRoutes";
 import adminOnboarding from "./routes/admin/onboardingRoutes";
 import adminCommission from "./routes/admin/commissionPlansRoutes";
 import adminReports from "./routes/admin/reportsRoutes";
-
+import utilityRoutes from "./routes/delivry_marketplace_v1/utility";
 import adminMarketers from "./routes/admin/marketersRoutes";
 import adminStoreModeration from "./routes/admin/storeModerationRoutes";
 
@@ -79,7 +79,8 @@ export const io = new IOServer(server, {
     origin: "*",
   },
 });
-dayjs.extend(utc); dayjs.extend(tz);
+dayjs.extend(utc);
+dayjs.extend(tz);
 dayjs.tz.setDefault("Asia/Aden");
 process.env.TZ = "Asia/Aden";
 // Middleware for Socket.IO verification
@@ -123,7 +124,8 @@ io.on("connection", (socket) => {
       if (!order) return;
 
       const isAdmin = role === "admin" || role === "superadmin";
-      const isOwner = socket.data.userId && order.user?.toString() === socket.data.userId;
+      const isOwner =
+        socket.data.userId && order.user?.toString() === socket.data.userId;
 
       // (اختياري) توسعة: السماح للسائق/التاجر — تحتاج vendorId/driverId على socket.data
       // const isOrderDriver = socket.data.driverId && order.driver?.toString() === socket.data.driverId;
@@ -150,7 +152,7 @@ io.on("connection", (socket) => {
 app.use(
   cors({
     origin: "*", // أو حدد نطاق فرونتك فقط مثل: "https://your-app.onrender.com"
-    methods: ["GET", "POST", "PUT", "DELETE","PATCH"],
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
     credentials: true,
   })
 );
@@ -228,11 +230,11 @@ app.use(`${API_PREFIX}/`, adminStoreModeration);
 
 // قسم طلبات وسائق التوصيل
 app.use(`${API_PREFIX}/deliveryapp/withdrawals`, driverWithdrawalRoutes);
-
+app.use(`${API_PREFIX}/utility`, utilityRoutes);
 // قسم التاجر
 app.use(`${API_PREFIX}/vendor`, vendorRoutes);
 app.use(`${API_PREFIX}/pricing-strategies`, pricingStrategyRoutes);
-app.use('/api/v1', marketingRouter);
+app.use("/api/v1", marketingRouter);
 
 // قسم الوظائف والمستقلين
 

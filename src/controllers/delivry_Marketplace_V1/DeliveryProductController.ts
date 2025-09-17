@@ -3,6 +3,7 @@ import DeliveryProduct from "../../models/delivry_Marketplace_V1/DeliveryProduct
 import Vendor from "../../models/vendor_app/Vendor";
 import StoreSection from "../../models/delivry_Marketplace_V1/StoreSection";
 import mongoose from "mongoose";
+import { applyPromotionToProduct, fetchActivePromotions } from "../../services/promotion/pricing.service";
 
 // Create
 export const create = async (req: Request, res: Response) => {
@@ -65,11 +66,44 @@ export const create = async (req: Request, res: Response) => {
 // Read all
 export const getAll = async (req: Request, res: Response) => {
   try {
-    // دعم الفلترة حسب المتجر/القسم الفرعي
+    // فلترة أساسية
     const filter: any = {};
     if (req.query.store) filter.store = req.query.store;
     if (req.query.subCategory) filter.subCategory = req.query.subCategory;
-    const data = await DeliveryProduct.find(filter).populate("subCategory");
+
+    // سياق التسعير (مدينة/قناة)
+    const city = (req.query.city as string) || (req.headers["x-city"] as string) || undefined;
+    const channel: "app" | "web" = (req.query.channel as any) || "app";
+
+    // جلب المنتجات (lean أسرع)
+    const products = await DeliveryProduct.find(filter)
+      .populate("subCategory")
+      .lean();
+
+    // ملاحظة: التسعير لا يعتمد على placement؛ الـplacement لعرض البانرات فقط
+    const promos = await fetchActivePromotions({ city, channel });
+
+    const data = products.map((p: any) => {
+      // نمرر ما يكفي للتطابق: المنتج + المتجر. (الفئة: غير متاحة هنا افتراضياً)
+      const priced = applyPromotionToProduct(
+        {
+          _id: p._id,
+          price: p.price,
+          store: p.store,
+          // لو لاحقاً ربطت StoreSection بـ DeliveryCategory أضفها هنا:
+          // categories: p.deliveryCategory ? [p.deliveryCategory] : []
+        },
+        promos
+      );
+
+      return {
+        ...p,
+        originalPrice: priced.originalPrice,
+        price: priced.finalPrice,            // ← السعر بعد الخصم
+        appliedPromotion: priced.appliedPromotion
+      };
+    });
+
     res.json(data);
   } catch (error: any) {
     res.status(500).json({ message: error.message });
@@ -77,14 +111,39 @@ export const getAll = async (req: Request, res: Response) => {
 };
 
 // Read by ID
+// Read by ID
 export const getById = async (req: Request, res: Response) => {
   try {
-    const data = await DeliveryProduct.findById(req.params.id).populate("subCategory");
-    if (!data) {
+    const city = (req.query.city as string) || (req.headers["x-city"] as string) || undefined;
+    const channel: "app" | "web" = (req.query.channel as any) || "app";
+
+    const p = await DeliveryProduct.findById(req.params.id)
+      .populate("subCategory")
+      .lean();
+
+    if (!p) {
       res.status(404).json({ message: "Not found" });
       return;
     }
-    res.json(data);
+
+    const promos = await fetchActivePromotions({ city, channel });
+
+    const priced = applyPromotionToProduct(
+      {
+        _id: p._id,
+        price: p.price,
+        store: p.store,
+        // categories: p.deliveryCategory ? [p.deliveryCategory] : []
+      },
+      promos
+    );
+
+    res.json({
+      ...p,
+      originalPrice: priced.originalPrice,
+      price: priced.finalPrice,
+      appliedPromotion: priced.appliedPromotion
+    });
   } catch (error: any) {
     res.status(500).json({ message: error.message });
   }
@@ -134,19 +193,32 @@ export const update = async (req: Request, res: Response) => {
 };
 
 // Delete
+// Delete
 export const remove = async (req: Request, res: Response) => {
   try {
-    await DeliveryProduct.findByIdAndDelete(req.params.id);
+    const prod = await DeliveryProduct.findById(req.params.id);
+    if (!prod) {
+      res.status(404).json({ message: "Product not found" });
+      return;
+    }
+
     if (req.user.role === "vendor") {
       const vendor = await Vendor.findOne({ user: req.user.id });
       if (!vendor) {
         res.status(403).json({ message: "ليس لديك حساب تاجر" });
         return;
       }
-      // ملاحظة: هنا يفضل جلب المنتج أولاً ثم تحقق أن المتجر مطابق وليس body.store!
+      // تحقق من ملكية المتجر عبر المنتج نفسه (وليس body)
+      if (vendor.store.toString() !== prod.store.toString()) {
+        res.status(403).json({ message: "ليس لديك صلاحية حذف منتج من هذا المتجر" });
+        return;
+      }
     }
+
+    await DeliveryProduct.findByIdAndDelete(prod._id);
     res.json({ message: "DeliveryProduct deleted" });
   } catch (error: any) {
     res.status(500).json({ message: error.message });
   }
 };
+

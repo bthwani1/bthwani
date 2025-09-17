@@ -18,23 +18,20 @@ export const createPromotion = async (req: Request, res: Response) => {
 // Get all (للعميل وغير المسؤول)
 export const getActivePromotions = async (req: Request, res: Response) => {
   try {
-    const isAdmin = req.user?.role === "admin" || req.user?.role === "superadmin";
+    const { placement, city, channel } = req.query as any;
 
-    const filter = isAdmin
-      ? {}  // المسؤول يرى كل العروض
-      : {
-          isActive: true,
-          $or: [
-            // بدون تواريخ
-            { startDate: { $exists: false }, endDate: { $exists: false } },
-            // ضمن الفترة
-            { startDate: { $lte: now }, endDate: { $gte: now } },
-            // بدأت فقط
-            { startDate: { $lte: now }, endDate: { $exists: false } },
-            // تنتهي فقط
-            { startDate: { $exists: false }, endDate: { $gte: now } },
-          ],
-        };
+    const now = new Date();
+    const filter: any = {
+      isActive: true,
+      $and: [
+        { $or: [{ startDate: { $exists: false } }, { startDate: { $lte: now } }] },
+        { $or: [{ endDate: { $exists: false } }, { endDate: { $gte: now } }] },
+      ],
+    };
+
+    if (placement) filter.placements = placement;
+    if (city) filter.$or = [{ cities: { $size: 0 } }, { cities: city }];
+    if (channel) filter.$and.push({ $or: [{ channels: { $size: 0 } }, { channels: channel }] });
 
     const promos = await Promotion.find(filter)
       .sort({ order: 1, createdAt: -1 })
@@ -45,7 +42,6 @@ export const getActivePromotions = async (req: Request, res: Response) => {
     res.status(500).json({ message: err.message });
   }
 };
-
 // Get by ID
 export const getPromotionById = async (req: Request, res: Response) => {
   try {

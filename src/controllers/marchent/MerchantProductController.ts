@@ -2,6 +2,10 @@ import { Request, Response } from "express";
 import MerchantProduct from "../../models/mckathi/MerchantProduct";
 import ProductCatalog from "../../models/mckathi/ProductCatalog";
 import StoreSection from "../../models/delivry_Marketplace_V1/StoreSection";
+import {
+  applyPromotionToProduct,
+  fetchActivePromotions,
+} from "../../services/promotion/pricing.service";
 
 // --- جلب كل المنتجات (للمشرف/admin)
 export const getAllMerchantProducts = async (req: Request, res: Response) => {
@@ -9,6 +13,13 @@ export const getAllMerchantProducts = async (req: Request, res: Response) => {
     const filter: any = {};
     if (req.query.store) filter.store = req.query.store;
     if (req.query.section) filter.section = req.query.section;
+
+    const city =
+      (req.query.city as string) ||
+      (req.headers["x-city"] as string) ||
+      undefined;
+    const channel: "app" | "web" = (req.query.channel as any) || "app";
+
     const products = await MerchantProduct.find(filter)
       .populate({
         path: "product",
@@ -17,21 +28,57 @@ export const getAllMerchantProducts = async (req: Request, res: Response) => {
       .populate("store")
       .populate("merchant")
       .populate("customAttributes.attribute")
-      .populate("section");
+      .populate("section")
+      .lean();
 
-    res.json(products);
-  } catch (err) {
-    res.status(500).json({ message: "حدث خطأ", error: err });
+    const promos = await fetchActivePromotions({ city, channel });
+
+    const data = products.map((mp: any) => {
+      const catalog = mp.product; // يحتوي category
+      // Always return an array of category IDs
+      let categories: any[] = [];
+      if (catalog?.category) {
+        if (Array.isArray(catalog.category)) {
+          categories = catalog.category.map((cat: any) => cat._id || cat);
+        } else {
+          categories = [catalog.category._id || catalog.category];
+        }
+      }
+      const priced = applyPromotionToProduct(
+        {
+          _id: mp._id,
+          price: mp.price,
+          store: mp.store?._id || mp.store,
+          categories,
+        },
+        promos
+      );
+      return {
+        ...mp,
+        originalPrice: priced.originalPrice,
+        price: priced.finalPrice,
+        appliedPromotion: priced.appliedPromotion,
+      };
+    });
+
+    res.json(data);
+  } catch (err: any) {
+    res.status(500).json({ message: "حدث خطأ", error: err.message || err });
   }
 };
 
-// --- جلب منتجات تاجر محدد
 export const getMerchantProductsByMerchant = async (
   req: Request,
   res: Response
 ) => {
   try {
     const { merchantId } = req.params;
+    const city =
+      (req.query.city as string) ||
+      (req.headers["x-city"] as string) ||
+      undefined;
+    const channel: "app" | "web" = (req.query.channel as any) || "app";
+
     const products = await MerchantProduct.find({ merchant: merchantId })
       .populate({
         path: "product",
@@ -39,32 +86,97 @@ export const getMerchantProductsByMerchant = async (
       })
       .populate("merchant")
       .populate("store")
-      .populate("customAttributes.attribute");
-    res.json(products);
-  } catch (err) {
-    res.status(500).json({ message: "حدث خطأ", error: err });
+      .populate("customAttributes.attribute")
+      .lean();
+
+    const promos = await fetchActivePromotions({ city, channel });
+
+    const data = products.map((mp: any) => {
+      const catalog = mp.product;
+      let categories: any[] = [];
+      if (catalog?.category) {
+        if (Array.isArray(catalog.category)) {
+          categories = catalog.category.map((cat: any) => cat._id || cat);
+        } else {
+          categories = [catalog.category._id || catalog.category];
+        }
+      }
+      const priced = applyPromotionToProduct(
+        {
+          _id: mp._id,
+          price: mp.price,
+          store: mp.store?._id || mp.store,
+          categories,
+        },
+        promos
+      );
+      return {
+        ...mp,
+        originalPrice: priced.originalPrice,
+        price: priced.finalPrice,
+        appliedPromotion: priced.appliedPromotion,
+      };
+    });
+
+    res.json(data);
+  } catch (err: any) {
+    res.status(500).json({ message: "حدث خطأ", error: err.message || err });
   }
 };
 
 // --- جلب منتج تاجر مفرد
 export const getMerchantProductById = async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
-    const product = await MerchantProduct.findById(id)
+    const city =
+      (req.query.city as string) ||
+      (req.headers["x-city"] as string) ||
+      undefined;
+    const channel: "app" | "web" = (req.query.channel as any) || "app";
+
+    const mp = await MerchantProduct.findById(req.params.id)
       .populate({
         path: "product",
         populate: { path: "attributes.attribute category" },
       })
       .populate("merchant")
       .populate("store")
-      .populate("customAttributes.attribute");
-    if (!product) {
+      .populate("customAttributes.attribute")
+      .lean();
+
+    if (!mp) {
       res.status(404).json({ message: "المنتج غير موجود" });
       return;
     }
-    res.json(product);
-  } catch (err) {
-    res.status(500).json({ message: "حدث خطأ", error: err });
+
+    const promos = await fetchActivePromotions({ city, channel });
+
+    const catalog = mp.product;
+    let categories: any[] = [];
+    if (catalog?.category) {
+      if (Array.isArray(catalog.category)) {
+        categories = catalog.category.map((cat: any) => cat._id || cat);
+      } else {
+        categories = [catalog.category._id || catalog.category];
+      }
+    }
+    const priced = applyPromotionToProduct(
+      {
+        _id: mp._id,
+        price: mp.price,
+        store: mp.store?._id || mp.store,
+        categories,
+      },
+      promos
+    );
+
+    res.json({
+      ...mp,
+      originalPrice: priced.originalPrice,
+      price: priced.finalPrice,
+      appliedPromotion: priced.appliedPromotion,
+    });
+  } catch (err: any) {
+    res.status(500).json({ message: "حدث خطأ", error: err.message || err });
   }
 };
 
@@ -75,7 +187,13 @@ export const getMerchantProductsByCategory = async (
 ) => {
   try {
     const { merchantId, categoryId } = req.params;
-    // احصل على كل منتجات التاجر واربطها بمنتجات الكاتالوج داخل نفس القسم
+
+    const city =
+      (req.query.city as string) ||
+      (req.headers["x-city"] as string) ||
+      undefined;
+    const channel: "app" | "web" = (req.query.channel as any) || "app";
+
     const products = await MerchantProduct.find({ merchant: merchantId })
       .populate({
         path: "product",
@@ -84,12 +202,43 @@ export const getMerchantProductsByCategory = async (
       })
       .populate("merchant")
       .populate("store")
-      .populate("customAttributes.attribute");
-    // حذف النتائج التي لم تتطابق مع التصنيف (match يُرجع product=null إذا لا ينتمي للقسم)
-    const filtered = products.filter((p) => p.product !== null);
-    res.json(filtered);
-  } catch (err) {
-    res.status(500).json({ message: "حدث خطأ", error: err });
+      .populate("customAttributes.attribute")
+      .lean();
+
+    const filtered = products.filter((p: any) => p.product !== null);
+
+    const promos = await fetchActivePromotions({ city, channel });
+
+    const data = filtered.map((mp: any) => {
+      const catalog = mp.product;
+      let categories: any[] = [];
+      if (catalog?.category) {
+        if (Array.isArray(catalog.category)) {
+          categories = catalog.category.map((cat: any) => cat._id || cat);
+        } else {
+          categories = [catalog.category._id || catalog.category];
+        }
+      }
+      const priced = applyPromotionToProduct(
+        {
+          _id: mp._id,
+          price: mp.price,
+          store: mp.store?._id || mp.store,
+          categories,
+        },
+        promos
+      );
+      return {
+        ...mp,
+        originalPrice: priced.originalPrice,
+        price: priced.finalPrice,
+        appliedPromotion: priced.appliedPromotion,
+      };
+    });
+
+    res.json(data);
+  } catch (err: any) {
+    res.status(500).json({ message: "حدث خطأ", error: err.message || err });
   }
 };
 

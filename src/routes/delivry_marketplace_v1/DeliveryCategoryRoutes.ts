@@ -4,6 +4,7 @@ import express from "express";
 import * as controller from "../../controllers/delivry_Marketplace_V1/DeliveryCategoryController";
 import { verifyAdmin } from "../../middleware/verifyAdmin";
 import { verifyFirebase } from "../../middleware/verifyFirebase";
+import { requireRole } from "../../middleware/auth";
 
 const router = express.Router();
 
@@ -62,7 +63,14 @@ router.post("/", verifyFirebase, verifyAdmin, controller.create);
 router.get("/children/:parentId", controller.getChildren);
 
 router.get("/main", controller.getMainCategories);
-
+router.post(
+  "/bulk-reorder",
+  verifyFirebase,
+  verifyAdmin,
+  controller.bulkReorder
+);
+router.post("/:id/move-up", verifyFirebase, verifyAdmin, controller.moveUp);
+router.post("/:id/move-down", verifyFirebase, verifyAdmin, controller.moveDown);
 /**
  * @swagger
  * /delivery/categories/{id}:

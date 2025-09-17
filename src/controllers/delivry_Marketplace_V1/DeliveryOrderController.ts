@@ -17,8 +17,67 @@ import { pushStatusHistory } from "../../utils/orderHistory";
 import { broadcastOrder } from "../../sockets/orderEvents";
 import { postIfDeliveredOnce } from "../../accounting/hooks";
 import { broadcastOffersForOrder } from "../../services/dispatch";
-
+import {
+  fetchActivePromotions,
+  applyPromotionToProduct,
+} from "../../services/promotion/pricing.service";
+import DeliveryProduct from "../../models/delivry_Marketplace_V1/DeliveryProduct";
+import MerchantProduct from "../../models/mckathi/MerchantProduct";
 // 👇 ضِف أعلى هذا الملف
+type CartItem = {
+  productId: string;
+  productType?: "merchantProduct" | "deliveryProduct" | "delivery"; // حسب ما تخزِّنه في السلة
+  store: mongoose.Types.ObjectId | string;
+  quantity: number;
+  price?: number; // قد يكون موجودًا بالسلة لكن لن نعتمد عليه
+};
+
+async function priceSingleCartItem(it: CartItem, promos: any) {
+  if (it.productType === "merchantProduct") {
+    const mp = await MerchantProduct.findById(it.productId)
+      .populate({ path: "product", select: "category" }) // إن رغبت باستخدام عروض الفئة
+      .lean();
+
+    if (!mp) throw new Error("عنصر غير موجود (MerchantProduct)");
+
+    const priced = applyPromotionToProduct(
+      {
+        _id: mp._id,
+        price: mp.price, // السعر الأساسي عند التاجر
+        store: mp.store?._id || mp.store,
+        categories: mp.product ? [mp.product] : [],
+      },
+      promos
+    );
+
+    return {
+      unitPriceOriginal: priced.originalPrice,
+      unitPriceFinal: priced.finalPrice,
+      appliedPromotion: priced.appliedPromotion || null,
+    };
+  } else {
+    // delivery product
+    const dp = await DeliveryProduct.findById(it.productId).lean();
+    if (!dp) throw new Error("عنصر غير موجود (DeliveryProduct)");
+
+    const priced = applyPromotionToProduct(
+      {
+        _id: dp._id,
+        price: dp.price, // السعر الأساسي في كتالوج التوصيل
+        store: dp.store,
+        // إن لاحقًا ربطت المنتج بفئة: categories: [dp.deliveryCategory]
+      },
+      promos
+    );
+
+    return {
+      unitPriceOriginal: priced.originalPrice,
+      unitPriceFinal: priced.finalPrice,
+      appliedPromotion: priced.appliedPromotion || null,
+    };
+  }
+}
+
 function sanitizeNotes(raw: any): any[] {
   const toNote = (v: any) => {
     if (typeof v === "string") {
@@ -35,7 +94,13 @@ function sanitizeNotes(raw: any): any[] {
       const body = (v.body ?? "").toString().trim();
       if (!body) return null;
       const visibility = v.visibility === "public" ? "public" : "internal";
-      const byRole = ["customer","admin","store","driver","system"].includes(v.byRole)
+      const byRole = [
+        "customer",
+        "admin",
+        "store",
+        "driver",
+        "system",
+      ].includes(v.byRole)
         ? v.byRole
         : "system";
       const byId = v.byId ?? undefined;
@@ -51,7 +116,6 @@ function sanitizeNotes(raw: any): any[] {
   }
   return raw.map(toNote).filter(Boolean) as any[];
 }
-
 
 export const createOrder = async (req: Request, res: Response) => {
   const session = await mongoose.startSession();
@@ -116,11 +180,13 @@ export const createOrder = async (req: Request, res: Response) => {
       const s = await DeliveryStore.findById(stores[0]).session(session);
       if (!s) throw new Error("المتجر غير موجود");
       const distKm =
-      getDistance(
-  { latitude: s.location.lat, longitude: s.location.lng },
-  { latitude: chosenAddress.location.lat, longitude: chosenAddress.location.lng }
-)
-/ 1000;
+        getDistance(
+          { latitude: s.location.lat, longitude: s.location.lng },
+          {
+            latitude: chosenAddress.location.lat,
+            longitude: chosenAddress.location.lng,
+          }
+        ) / 1000;
       deliveryFee = calculateDeliveryPrice(distKm, strategy);
     } else {
       // لكل متجر ضمن السلة
@@ -139,7 +205,13 @@ export const createOrder = async (req: Request, res: Response) => {
       }
     }
 
-    // 9. إعداد subOrders واختيار السائق
+    // 9) جهّز العروض الفاعلة (سياق المدينة من العنوان المختار)
+    const promos = await fetchActivePromotions({
+      city: chosenAddress.city,
+      channel: "app",
+    });
+
+    // 9.1) إعداد subOrders واختيار السائق
     let commonDriver = null;
     if (deliveryMode === "unified") {
       const origin = await DeliveryStore.findById(stores[0]).session(session);
@@ -165,6 +237,49 @@ export const createOrder = async (req: Request, res: Response) => {
     const subOrders = await Promise.all(
       stores.map(async (storeId) => {
         const items = grouped[storeId];
+
+        // إعادة تسعير عناصر هذا المتجر
+        const pricedItems = [];
+        let subTotal = 0;
+        const subAppliedPromos: any[] = [];
+
+        for (const i of items) {
+          const priced = await priceSingleCartItem(
+            {
+              productId: i.productId.toString(),
+              productType: i.productType || "delivery",
+              store: i.store,
+              quantity: i.quantity,
+              price: i.price, // لن نعتمد عليه
+            },
+            promos
+          );
+
+          const lineTotal = priced.unitPriceFinal * i.quantity;
+          subTotal += lineTotal;
+
+          if (priced.appliedPromotion) {
+            subAppliedPromos.push({
+              promoId: priced.appliedPromotion.promoId,
+              title: priced.appliedPromotion.title,
+              amount: priced.appliedPromotion.amount * i.quantity,
+              target: priced.appliedPromotion.target,
+            });
+          }
+
+          // ⚠️ مهم: استخدم السعر النهائي كـ unitPrice (لتوافق السكيمة الحالية).
+          // لو سكيمة subOrders.items تسمح، أضف الحقول التوضيحية (Original/Final).
+          pricedItems.push({
+            product: i.productId,
+            productType: i.productType,
+            quantity: i.quantity,
+            unitPrice: priced.unitPriceFinal, // ← السعر المجمد بعد الخصم
+            unitPriceOriginal: priced.unitPriceOriginal, // (اختياري إن كانت السكيمة تسمح)
+            appliedPromotion: priced.appliedPromotion || undefined, // (اختياري)
+          });
+        }
+
+        // اختيار سائق مبدئي (كما كان عندك)
         let driver = commonDriver;
         if (!driver) {
           const s = await DeliveryStore.findById(storeId).session(session)!;
@@ -184,28 +299,28 @@ export const createOrder = async (req: Request, res: Response) => {
             })
             .session(session);
         }
+
         return {
           store: storeId,
-          items: items.map((i) => ({
-            product: i.productId, // هذا هو المعرف
-            productType: i.productType, // أضف هذا السطر
-            quantity: i.quantity,
-            unitPrice: i.price,
-          })),
+          items: pricedItems,
           driver: driver?._id || null,
           status: "pending_confirmation" as const,
+          subTotal, // (اختياري) لو سكيمتك تسمح
+          subAppliedPromos, // (اختياري) لو سكيمتك تسمح
         };
       })
     );
-    // 10. حساب المشاركة حسب كل متجر
-    // 10. حساب companyShare و platformShare
+
+    // 10) حساب المشاركة (Company/Platform) بناءً على الأسعار **بعد** الخصم
     let totalCompanyShare = 0;
     let totalPlatformShare = 0;
+
     for (const so of subOrders) {
       const s = await DeliveryStore.findById(so.store).session(session);
       if (!s) continue;
+
       const subTotal = so.items.reduce(
-        (sum, it) => sum + it.quantity * it.unitPrice,
+        (sum: number, it: any) => sum + it.quantity * it.unitPrice,
         0
       );
       const rate = s.takeCommission ? s.commissionRate : 0;
@@ -214,72 +329,81 @@ export const createOrder = async (req: Request, res: Response) => {
       totalPlatformShare += subTotal - companyShare;
     }
 
-   // 11) المبلغ النهائي
-const totalPrice = cart.total + deliveryFee;
+    // 11) إجمالي السلع + رسوم التوصيل
+    const itemsTotal = subOrders.reduce(
+      (sum: number, so: any) =>
+        sum +
+        so.items.reduce(
+          (s: number, it: any) => s + it.quantity * it.unitPrice,
+          0
+        ),
+      0
+    );
+    const totalPrice = itemsTotal + deliveryFee;
 
-// 11.1) احسب من المحفظة والكاش
-let walletUsed = 0;
-if (paymentMethod === "wallet" || paymentMethod === "mixed") {
-  walletUsed = Math.min(user.wallet.balance, totalPrice);
-}
-const cashDue = totalPrice - walletUsed;
+    // 11.1) تجميع أثر العروض على مستوى الطلب (اختياري)
+    const appliedPromotions: any[] = [];
+    for (const so of subOrders) {
+      if (Array.isArray(so.subAppliedPromos))
+        appliedPromotions.push(...so.subAppliedPromos);
+    }
 
-// 11.2) خصم المحفظة مرة واحدة
-if (walletUsed > 0) {
-  user.wallet.balance -= walletUsed;
-  await user.save({ session });
-}
+    // 11.2) محفظة/كاش
+    let walletUsed = 0;
+    if (paymentMethod === "wallet" || paymentMethod === "mixed") {
+      walletUsed = Math.min(user.wallet.balance, totalPrice);
+    }
+    const cashDue = totalPrice - walletUsed;
 
-// 11.3) حدد الـ paymentMethod النهائي و paid
-let finalPaymentMethod: "wallet" | "cash" | "card" | "mixed" = "wallet";
-if (cashDue > 0) {
-  // لو العميل اختار بطاقة: mixed (wallet + card)
-  // لو اختار كاش: mixed (wallet + cash)
-  finalPaymentMethod = "mixed";
-} else {
-  finalPaymentMethod = "wallet";
-}
+    if (walletUsed > 0) {
+      user.wallet.balance -= walletUsed;
+      await user.save({ session });
+    }
 
-const paid = cashDue === 0; // لو الكاش/البطاقة لاحقًا، خليه false الآن
-let initialNotes: any[] = [];
-if (typeof notes === "string" && notes.trim()) {
-  initialNotes.push({
-    body: notes.trim(),
-    visibility: "public",     // العميل يشوفها
-    byRole: "customer",
-    byId: user._id,
-    createdAt: new Date(),
-  });
-}
+    let finalPaymentMethod: "wallet" | "cash" | "card" | "mixed" = "wallet";
+    if (cashDue > 0) finalPaymentMethod = "mixed";
+    const paid = cashDue === 0;
 
-// 13) إنشاء الطلب
-const order = new DeliveryOrder({
-  user: user._id,
-  deliveryMode,
-  scheduledFor: scheduledFor || null,
-  address: {
-    label: chosenAddress.label,
-    street: chosenAddress.street,
-    city: chosenAddress.city,
-    location: {
-      lat: chosenAddress.location.lat,
-      lng: chosenAddress.location.lng,
-    },
-  },
-  subOrders,
-  deliveryFee,
-  price: totalPrice,
-  companyShare: totalCompanyShare,     // <-- مهم
-  platformShare: totalPlatformShare,   // <-- مهم
-  walletUsed,
-  cashDue,
-  paymentMethod: finalPaymentMethod,
-  status: "pending_confirmation",
-  paid,
-  // لو ما في ملاحظة، اتركه undefined ليشتغل default: []
-  notes: initialNotes.length ? initialNotes : undefined,
-});
-
+    // 12) إنشاء الطلب وتجميد الأسعار
+    const order = new DeliveryOrder({
+      user: user._id,
+      deliveryMode,
+      scheduledFor: scheduledFor || null,
+      address: {
+        label: chosenAddress.label,
+        street: chosenAddress.street,
+        city: chosenAddress.city,
+        location: {
+          lat: chosenAddress.location.lat,
+          lng: chosenAddress.location.lng,
+        },
+      },
+      subOrders,
+      deliveryFee,
+      price: totalPrice,
+      itemsTotal, // (اختياري إن كانت السكيمة تسمح)
+      companyShare: totalCompanyShare,
+      platformShare: totalPlatformShare,
+      walletUsed,
+      cashDue,
+      paymentMethod: finalPaymentMethod,
+      status: "pending_confirmation",
+      paid,
+      appliedPromotions, // (اختياري) أثر العروض على مستوى الطلب
+      pricesFrozenAt: new Date(), // (اختياري) حقل لتجميد التسعير
+      notes:
+        typeof notes === "string" && notes.trim()
+          ? [
+              {
+                body: notes.trim(),
+                visibility: "public",
+                byRole: "customer",
+                byId: user._id,
+                createdAt: new Date(),
+              },
+            ]
+          : undefined,
+    });
     // 13. إنشاء الطلب
     await order.save({ session });
 
@@ -323,8 +447,8 @@ export const assignDriver = async (req: Request, res: Response) => {
     const order: any = await DeliveryOrder.findById(id);
     if (!order) {
       res.status(404).json({ message: "Order not found" });
-      return
-    } 
+      return;
+    }
 
     const actor = getActor(req);
     if (actor.role !== "admin") {
@@ -342,7 +466,7 @@ export const assignDriver = async (req: Request, res: Response) => {
     order.notes = sanitizeNotes(order.notes);
 
     order.driver = driver._id;
-    order.status = "assigned";                // 👈 اجعلها حالة إسناد (لو مدعومة عندك)
+    order.status = "assigned"; // 👈 اجعلها حالة إسناد (لو مدعومة عندك)
     order.assignedAt = new Date();
     order.statusHistory.push({
       status: "assigned",
@@ -374,7 +498,7 @@ export const assignDriverToSubOrder = async (req: Request, res: Response) => {
     const { driverId } = req.body;
 
     const actor = getActor(req);
-    if (actor.role !== "admin" && actor.role !== "store"){
+    if (actor.role !== "admin" && actor.role !== "store") {
       res.status(403).json({ message: "Forbidden" });
 
       return;
@@ -400,7 +524,10 @@ export const assignDriverToSubOrder = async (req: Request, res: Response) => {
 
     sub.driver = driver._id;
     await order.save();
-    broadcastOrder("order.sub.driver.assigned", order._id.toString(), { subId, driverId });
+    broadcastOrder("order.sub.driver.assigned", order._id.toString(), {
+      subId,
+      driverId,
+    });
 
     res.json(order);
   } catch (e: any) {
@@ -411,10 +538,14 @@ export const assignDriverToSubOrder = async (req: Request, res: Response) => {
 export const updateSubOrderStatus = async (req: Request, res: Response) => {
   try {
     const { orderId, subId } = req.params as any;
-    const { status, reason, returnBy } = req.body as { status: OrderStatus; reason?: string; returnBy?: string };
+    const { status, reason, returnBy } = req.body as {
+      status: OrderStatus;
+      reason?: string;
+      returnBy?: string;
+    };
 
     const actor = getActor(req);
-    if (!["admin", "store", "driver"].includes(actor.role)){
+    if (!["admin", "store", "driver"].includes(actor.role)) {
       res.status(403).json({ message: "Forbidden" });
 
       return;
@@ -433,13 +564,21 @@ export const updateSubOrderStatus = async (req: Request, res: Response) => {
     }
 
     // حارس الانتقال لــ subOrder
-    if (!canTransition(sub.status, status)) {
-      res.status(400).json({ message: `Invalid transition from ${sub.status} to ${status}` });
+    if (!canTransition(sub.status, status as any)) {
+      res.status(400).json({
+        message: `Invalid transition from ${sub.status} to ${status}`,
+      });
       return;
     }
 
     // حدّث subOrder
-    pushStatusHistory(sub, status, actor.role as any, reason, returnBy as any);
+    pushStatusHistory(
+      sub,
+      status as any,
+      actor.role as any,
+      reason,
+      returnBy as any
+    );
 
     // يمكنك أيضًا مزامنة حالة order العليا (اختياريًا):
     // مثال: إذا كل subOrders = delivered → order.status=delivered
@@ -456,9 +595,12 @@ export const updateSubOrderStatus = async (req: Request, res: Response) => {
     try {
       await postIfDeliveredOnce(order);
     } catch (e) {
-      console.error("Accounting posting failed (updateSubOrderStatus):", (e as Error).message);
+      console.error(
+        "Accounting posting failed (updateSubOrderStatus):",
+        (e as Error).message
+      );
     }
-    
+
     res.json(order);
   } catch (e: any) {
     res.status(500).json({ message: e.message });
@@ -485,7 +627,6 @@ export const setOrderPOD = async (req: Request, res: Response) => {
     await order.save();
     broadcastOrder("order.pod.set", id, { deliveryReceiptNumber });
 
-    
     res.json(order);
   } catch (e: any) {
     res.status(500).json({ message: e.message });
@@ -534,7 +675,7 @@ export const addOrderNote = async (req: Request, res: Response) => {
       visibility,
       by: getActor(req).role,
     });
-    
+
     res.status(201).json(order.notes[order.notes.length - 1]);
   } catch (e: any) {
     res.status(500).json({ message: e.message });
@@ -555,8 +696,10 @@ export const listOrderNotes = async (req: Request, res: Response) => {
 
     let notes = order.notes || [];
 
-    if (scope === "public") notes = notes.filter((n: any) => n.visibility === "public");
-    else if (scope === "internal") notes = notes.filter((n: any) => n.visibility === "internal");
+    if (scope === "public")
+      notes = notes.filter((n: any) => n.visibility === "public");
+    else if (scope === "internal")
+      notes = notes.filter((n: any) => n.visibility === "internal");
     else {
       // auto
       if (actor.role === "customer") {
@@ -594,7 +737,10 @@ export const setSubOrderPOD = async (req: Request, res: Response) => {
 
     sub.deliveryReceiptNumber = deliveryReceiptNumber;
     await order.save();
-    broadcastOrder("order.sub.pod.set", orderId, { subId, deliveryReceiptNumber });
+    broadcastOrder("order.sub.pod.set", orderId, {
+      subId,
+      deliveryReceiptNumber,
+    });
 
     res.json(order);
   } catch (e: any) {
@@ -611,7 +757,9 @@ export const vendorAcceptOrder = async (req: Request, res: Response) => {
   }
 
   if (!canTransition(order.status, "preparing")) {
-    res.status(400).json({ message: `Invalid transition from ${order.status} to preparing` });
+    res.status(400).json({
+      message: `Invalid transition from ${order.status} to preparing`,
+    });
     return;
   }
 
@@ -628,11 +776,18 @@ export const vendorAcceptOrder = async (req: Request, res: Response) => {
       isBanned: false,
       $or: [
         { isJoker: false },
-        { isJoker: true, jokerFrom: { $lte: new Date() }, jokerTo: { $gte: new Date() } },
+        {
+          isJoker: true,
+          jokerFrom: { $lte: new Date() },
+          jokerTo: { $gte: new Date() },
+        },
       ],
       currentLocation: {
         $near: {
-          $geometry: { type: "Point", coordinates: [store.location.lng, store.location.lat] },
+          $geometry: {
+            type: "Point",
+            coordinates: [store.location.lng, store.location.lat],
+          },
           $maxDistance: 5000,
         },
       },
@@ -643,7 +798,7 @@ export const vendorAcceptOrder = async (req: Request, res: Response) => {
       return;
     }
 
-    order.driver = driver._id;            // 👈 اسناد فعلي
+    order.driver = driver._id; // 👈 اسناد فعلي
     if (!order.assignedAt) order.assignedAt = new Date();
   } else {
     // split: اسناد لكل subOrder
@@ -653,15 +808,19 @@ export const vendorAcceptOrder = async (req: Request, res: Response) => {
       if (!s) continue;
 
       const drv = await Driver.findOne({
-        isAvailable: true, isBanned: false,
+        isAvailable: true,
+        isBanned: false,
         currentLocation: {
           $near: {
-            $geometry: { type: "Point", coordinates: [s.location.lng, s.location.lat] },
+            $geometry: {
+              type: "Point",
+              coordinates: [s.location.lng, s.location.lat],
+            },
             $maxDistance: 5000,
           },
         },
       });
-      if (drv) sub.driver = drv._id;      // 👈 اسناد السائق للـ subOrder
+      if (drv) sub.driver = drv._id; // 👈 اسناد السائق للـ subOrder
     }
     if (!order.assignedAt) order.assignedAt = new Date();
   }
@@ -676,12 +835,10 @@ export const vendorAcceptOrder = async (req: Request, res: Response) => {
   res.json(order);
 };
 
-
-
 export const exportOrdersToExcel = async (req, res: Response) => {
   try {
     const orders = await DeliveryOrder.find()
-      .populate({ path: 'user', select: 'fullName phone' })
+      .populate({ path: "user", select: "fullName phone" })
       .lean();
 
     // const excelData = orders.map((order) => ({
@@ -695,7 +852,7 @@ export const exportOrdersToExcel = async (req, res: Response) => {
 
     // باقي الكود نفسه...
   } catch (error) {
-    res.status(500).json({ message: 'فشل التصدير', error });
+    res.status(500).json({ message: "فشل التصدير", error });
   }
 };
 
@@ -735,11 +892,11 @@ export const adminChangeStatus = async (req: Request, res: Response) => {
     update.$unset = { returnReason: "", returnBy: "" };
   }
 
-  const order = await DeliveryOrder.findByIdAndUpdate(
-    req.params.id,
-    update,
-    { new: true, runValidators: true, context: "query" }
-  );
+  const order = await DeliveryOrder.findByIdAndUpdate(req.params.id, update, {
+    new: true,
+    runValidators: true,
+    context: "query",
+  });
 
   if (!order) {
     res.status(404).json({ message: "Order not found" });
@@ -754,8 +911,13 @@ export const adminChangeStatus = async (req: Request, res: Response) => {
     }
   }
   // ⚠️ لا تعيد تعديل/حفظ الوثيقة هنا
-  try { await postIfDeliveredOnce(order); } catch (e) {
-    console.error("Accounting posting failed (adminChangeStatus):", (e as Error).message);
+  try {
+    await postIfDeliveredOnce(order);
+  } catch (e) {
+    console.error(
+      "Accounting posting failed (adminChangeStatus):",
+      (e as Error).message
+    );
   }
 
   broadcastOrder("order.status", order._id.toString(), {
@@ -781,7 +943,10 @@ export const cancelOrder = async (req: Request, res: Response) => {
       return;
     }
 
-    const order: any = await DeliveryOrder.findOne({ _id: orderId, user: user._id });
+    const order: any = await DeliveryOrder.findOne({
+      _id: orderId,
+      user: user._id,
+    });
     if (!order) {
       res.status(404).json({ message: "Order not found or not yours" });
       return;
@@ -792,8 +957,14 @@ export const cancelOrder = async (req: Request, res: Response) => {
       return;
     }
 
-    pushStatusHistory(order, "cancelled", "customer", "User cancelled", "customer");
-    await order.save({ validateModifiedOnly: true }); 
+    pushStatusHistory(
+      order,
+      "cancelled",
+      "customer",
+      "User cancelled",
+      "customer"
+    );
+    await order.save({ validateModifiedOnly: true });
     res.json({ message: "Order cancelled", order });
   } catch (err: any) {
     res.status(500).json({ message: err.message });
@@ -805,7 +976,9 @@ export const getOrderNotes = async (req: Request, res: Response) => {
     const { id } = req.params;
     const actor = getActor(req);
     const scope = (req.query.visibility as string) || "auto"; // "public" | "internal" | "auto"
-    const sort = ((req.query.sort as string) || "asc").toLowerCase() as "asc" | "desc";
+    const sort = ((req.query.sort as string) || "asc").toLowerCase() as
+      | "asc"
+      | "desc";
 
     // العميل لا يُسمح له بقراءة ملاحظات طلب لا يملكه
     let query: any = { _id: id };
@@ -819,7 +992,9 @@ export const getOrderNotes = async (req: Request, res: Response) => {
       query.user = dbUser._id;
     }
 
-    const order: any = await DeliveryOrder.findOne(query).select("notes").lean();
+    const order: any = await DeliveryOrder.findOne(query)
+      .select("notes")
+      .lean();
     if (!order) {
       res.status(404).json({ message: "Order not found" });
       return;
@@ -860,15 +1035,18 @@ export const getOrderNotes = async (req: Request, res: Response) => {
 export const getUserOrders = async (req: Request, res: Response) => {
   try {
     const { userId } = req.params;
-    const orders = await DeliveryOrder.find({ user: userId }).sort({ createdAt: -1 }).lean();
+    const orders = await DeliveryOrder.find({ user: userId })
+      .sort({ createdAt: -1 })
+      .lean();
     const actor = getActor(req);
-    const sanitized = orders.map(o => ({
+    const sanitized = orders.map((o) => ({
       ...o,
-      notes: actor.role === "customer" ? (o.notes || []).filter((n:any)=> n.visibility==="public") : o.notes
+      notes:
+        actor.role === "customer"
+          ? (o.notes || []).filter((n: any) => n.visibility === "public")
+          : o.notes,
     }));
     res.json(sanitized);
-    
-    
   } catch (error: any) {
     res.status(500).json({ message: error.message });
   }
@@ -993,12 +1171,12 @@ export const repeatOrder = async (req: Request, res: Response) => {
 export const getOrderById = async (req: Request, res: Response) => {
   try {
     const order = await DeliveryOrder.findById(req.params.id)
-    .populate({ path: 'user', select: 'fullName name email phone' })
-    .populate({ path: 'driver', select: 'fullName phone' })
-    .populate({ path: 'subOrders.store', select: 'name logo address' })
-    .populate({ path: 'subOrders.driver', select: 'fullName phone' })
-    .populate({ path: 'items.store', select: 'name logo' });
-  
+      .populate({ path: "user", select: "fullName name email phone" })
+      .populate({ path: "driver", select: "fullName phone" })
+      .populate({ path: "subOrders.store", select: "name logo address" })
+      .populate({ path: "subOrders.driver", select: "fullName phone" })
+      .populate({ path: "items.store", select: "name logo" });
+
     if (!order) {
       res.status(404).json({ message: "الطلب غير موجود" });
       return;
@@ -1010,7 +1188,8 @@ export const getOrderById = async (req: Request, res: Response) => {
 };
 export const getAllOrders = async (req: Request, res: Response) => {
   try {
-    const { status, city, storeId, driverId, from, to, paymentMethod } = req.query as any;
+    const { status, city, storeId, driverId, from, to, paymentMethod } =
+      req.query as any;
 
     const and: any[] = [];
     if (status) and.push({ status });
@@ -1019,19 +1198,13 @@ export const getAllOrders = async (req: Request, res: Response) => {
 
     if (storeId) {
       and.push({
-        $or: [
-          { "subOrders.store": storeId },
-          { "items.store": storeId },
-        ],
+        $or: [{ "subOrders.store": storeId }, { "items.store": storeId }],
       });
     }
 
     if (driverId) {
       and.push({
-        $or: [
-          { driver: driverId },
-          { "subOrders.driver": driverId },
-        ],
+        $or: [{ driver: driverId }, { "subOrders.driver": driverId }],
       });
     }
 
@@ -1063,13 +1236,15 @@ export const updateOrderStatus = async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const { status, reason, returnBy } = req.body as {
-      status: OrderStatus; reason?: string; returnBy?: string;
+      status: OrderStatus;
+      reason?: string;
+      returnBy?: string;
     };
 
     const actor = getActor(req);
-    if (!["admin","driver","store"].includes(actor.role)) {
-       res.status(403).json({ message: "Forbidden" });
-       return;
+    if (!["admin", "driver", "store"].includes(actor.role)) {
+      res.status(403).json({ message: "Forbidden" });
+      return;
     }
 
     const order: any = await DeliveryOrder.findById(id);
@@ -1078,18 +1253,30 @@ export const updateOrderStatus = async (req: Request, res: Response) => {
       return;
     }
 
-    if (!canTransition(order.status, status)) {
-      res.status(400).json({ message: `Invalid transition from ${order.status} to ${status}` });
+    if (!canTransition(order.status, status as any)) {
+      res.status(400).json({
+        message: `Invalid transition from ${order.status} to ${status}`,
+      });
       return;
     }
-    if (status === "assigned" && !order.assignedAt) order.assignedAt = new Date();
+    if (status === "assigned" && !order.assignedAt)
+      order.assignedAt = new Date();
 
-    pushStatusHistory(order, status, actor.role as any, reason, returnBy as any);
+    pushStatusHistory(
+      order,
+      status as any,
+      actor.role as any,
+      reason,
+      returnBy as any
+    );
     await order.save();
     try {
       await postIfDeliveredOnce(order);
     } catch (e) {
-      console.error("Accounting posting failed (updateOrderStatus):", (e as Error).message);
+      console.error(
+        "Accounting posting failed (updateOrderStatus):",
+        (e as Error).message
+      );
     }
     // إشعار مختصر (اختياري)
     io.to(`user_${order.user.toString()}`).emit("notification", {
@@ -1103,10 +1290,9 @@ export const updateOrderStatus = async (req: Request, res: Response) => {
       status,
       by: getActor(req).role,
     });
-    
+
     res.json(order);
   } catch (error: any) {
     res.status(500).json({ message: error.message });
   }
 };
-
