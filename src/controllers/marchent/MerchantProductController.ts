@@ -150,15 +150,16 @@ export const getMerchantProductById = async (req: Request, res: Response) => {
 
     const promos = await fetchActivePromotions({ city, channel });
 
-    const catalog = mp.product;
-    let categories: any[] = [];
-    if (catalog?.category) {
-      if (Array.isArray(catalog.category)) {
-        categories = catalog.category.map((cat: any) => cat._id || cat);
-      } else {
-        categories = [catalog.category._id || catalog.category];
-      }
-    }
+    const catalog: any = mp.product;
+let categories: any[] = [];
+if (catalog?.category) {
+  if (Array.isArray(catalog.category)) {
+    categories = catalog.category.map((cat: any) => cat._id || cat);
+  } else {
+    categories = [ (catalog.category as any)._id || catalog.category ];
+  }
+}
+ 
     const priced = applyPromotionToProduct(
       {
         _id: mp._id,

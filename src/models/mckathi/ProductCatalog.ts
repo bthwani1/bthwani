@@ -1,5 +1,6 @@
 // models/ProductCatalog.ts
 import { Schema, model, Types, Document } from 'mongoose';
+import { ICategoryMac } from './CategoryMac';
 
 export interface IProductAttributeValue {
   attribute: Types.ObjectId;
@@ -11,7 +12,8 @@ export interface IProductCatalog extends Document {
   name: string;
   description?: string;
   image?: string;
-  category: Types.ObjectId;
+  category: Types.ObjectId | ICategoryMac;
+
   attributes?: IProductAttributeValue[];
   sellingUnits?: string[];
   usageType: 'grocery' | 'restaurant' | 'retail';

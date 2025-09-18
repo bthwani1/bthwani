@@ -1,6 +1,6 @@
-import MessagingPrefs from '../../models/MessagingPrefs';
 import MessageMetric from '../../models/MessageMetric';
 import Message from '../../models/Message';
+import MessagingPrefs from '../../models/support/MessagingPrefs';
 
 export async function filterByCap(userIds: string[], channel: "push"|"sms"|"inapp" = "push") {
   const prefs = await MessagingPrefs.find({ userId: { $in: userIds } }).lean();
@@ -10,12 +10,12 @@ export async function filterByCap(userIds: string[], channel: "push"|"sms"|"inap
   for (const u of userIds) {
     const p = prefs.find(x => x.userId === u);
     // opt-in
-    if (p && channel==="push" && p.pushOptIn===false) continue;
-    if (p && channel==="sms"  && p.smsOptIn===false) continue;
-    if (p && channel==="inapp"&& p.inappOptIn===false) continue;
+    if (p && channel==="push" && p.channels?.push===false) continue;
+    if (p && channel==="sms"  && p.channels?.sms===false) continue;
+    if (p && channel==="inapp"&& p.channels?.inApp===false) continue;
     // cap اليومي
     const cnt = await MessageMetric.countDocuments({ userId: u, channel, event:"sent", ts:{ $gte: since } });
-    const dailyCap = p?.caps?.daily ?? 1;
+    const dailyCap = p?.caps?.perDay ?? 1;
     if (cnt >= dailyCap) continue;
     // (MVP) تجاهل quietHours أو عالجها لاحقًا بحسب TZ
     ok.add(u);
